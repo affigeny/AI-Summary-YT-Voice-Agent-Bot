@@ -152,8 +152,7 @@ class AdvancedMediaYTAgentBotV2DB:
             logger.error(f"Ошибка записи в кэш YT: {e}")
 
     def extract_youtube_id(self, url: str) -> str:
-        pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/(?:[^/
-\s]+/\S+/|(?:v|e(?:mbed)?)/|shorts/|\S*?[?&]v=)|youtu\.be/)([a-zA-Z0-9_-]{11})'
+        pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/(?:[^/\n\\s]+/\\S+/|(?:v|e(?:mbed)?)/|shorts/|\\S*?[?&]v=)|youtu\.be/)([a-zA-Z0-9_-]{11})'
         match = re.search(pattern, url)
         return match.group(1) if match else None
 
