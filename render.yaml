@@ -1,0 +1,24 @@
+# Render deploy config (Blueprint)
+# https://render.com/docs/blueprint-spec
+services:
+  - type: worker
+    name: ai-summary-bot
+    runtime: docker
+    repo: https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot
+    region: frankfurt # или oregon / singapore
+    branch: main
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: AI_PROVIDER
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_API_URL
+        sync: false
+      - key: AI_MODEL
+        sync: false
+      - key: DB_PATH
+        sync: false
