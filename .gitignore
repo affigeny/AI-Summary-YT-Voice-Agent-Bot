@@ -1,1 +1,25 @@
-.env, __pycache__/, *.log
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Секреты
+.env
+SECRETS.env
+
+# База данных (создаётся в рантайме)
+*.db
+*.db-journal
+*.sqlite3
+
+# Логи
+*.log
+
+# ОС / IDE
+.DS_Store
+.idea/
+.vscode/

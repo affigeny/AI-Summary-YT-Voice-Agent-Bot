@@ -19,6 +19,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
+__version__ = "3.0.0"
+VERSION_STRING = "v3.0.0"
+
 import aiohttp
 import speech_recognition as sr
 from pydub import AudioSegment
@@ -351,7 +354,7 @@ class AdvancedMediaYTAgentBot:
     # -- Обработчики Telegram --
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text = (
-            "\U0001F680 **v2.0.0 (Версия с Базой Данных и Управлением Шаблонами)**\n\n"
+            "\U0001F680 **v3.0.0 (Версия с Базой Данных и Управлением Шаблонами)**\n\n"
             "В новой версии добавлены:\n"
             "\U0001F5C4 **SQLite База Данных**: Сессии, кэш субтитров и шаблоны сохраняются вечно.\n"
             "\U0001F4BE **Кэширование YouTube**: Повторный запрос видео выполняется мгновенно и без лимитов.\n"

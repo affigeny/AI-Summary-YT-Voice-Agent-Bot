@@ -1,105 +1,123 @@
-# 🤖 AI Summary YT Voice Agent Bot v2.1.0 (с Базой Данных)
+<div align="center">
 
-Telegram-бот на Python для полной переработки медиа-информации. Бот принимает **голосовые сообщения с микрофона, аудиофайлы любых форматов (MP3, WAV, OGG, M4A)** и **ссылки на YouTube (включая Shorts)**, автоматически транскрибирует их в текст, а затем предлагает переработать информацию по готовым ИИ-шаблонам или обсудить контент в режиме живого чата с LLM.
+# 🤖 AI Summary YT Voice Agent Bot
 
-В новой версии добавлена **SQLite База Данных** для постоянного хранения:
-- Кастомных шаблонов пользователей
-- Кэша транскриптов YouTube (экономия лимитов и ускорение повторных запросов)
-- Истории диалогов (сохранение контекста при перезапуске бота)
+**Принимает** YouTube-ссылки · голосовые · аудиофайлы<br>
+**Извлекает** транскрипт → **перерабатывает** через LLM (OpenRouter)<br>
+по выбранному шаблону: саммари, Пирамида Минто, экшен-план, конспект
+
+<img src="https://img.shields.io/badge/version-3.0.0-blue?style=for-the-badge" alt="version">
+<img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="license">
+<img src="https://img.shields.io/badge/python-3.11-ffd43b?style=for-the-badge" alt="python">
+
+</div>
 
 ---
 
-## 🚀 Основные возможности
+## ✨ Возможности
 
-* **Мультиформатный импорт аудио**: Обработка не только голосовых заметок Telegram (`.ogg`), но и прикрепленных аудиофайлов (`.mp3`, `.wav`, `.m4a`).
-* **Парсинг YouTube и Shorts**: Быстрое извлечение субтитров из обычных видеороликов и ультракоротких Shorts с имитацией сигнатуры реального браузера (User-Agent, Referer).
-* **Кэширование YouTube субтитров**: Повторный запрос видео выполняется мгновенно из локальной БД без обращения к внешним API.
-* **Кастомные ИИ-шаблоны**: Переработка транскрипта по одному клику:
-  * *Краткое саммари* (выделение главного буллетами).
-  * *Пирамида Минто* (структурирование от вывода к деталям).
-  * *Экшен-план (Action Items)* (создание чек-листа задач).
-  * *Аналитический конспект* (подробный разбор инсайтов).
-  * **Собственные шаблоны**: Создавайте и редактируйте свои шаблоны через команду `/add_template`.
-* **Свободный диалог с ИИ**: Обсуждайте материал с нейросетью прямо в чате, задавая уточняющие вопросы по контексту статьи, видео или записи.
-* **Гибкий бэкенд**: Легкое переключение между облачными API (OpenAI, DeepSeek) и локальными моделями через Ollama на вашем IP-адресе.
+| Возможность | Описание |
+|-----------|----------|
+| 📹 **YouTube/Shorts** | Умный парсинг субтитров (RU → EN → автогенерация), кэш в SQLite |
+| 🎙 **Голосовые / аудио** | Распознавание речи (Google Speech) через FFmpeg + pydub |
+| 🤖 **LLM-переработка** | OpenRouter (OpenAI-совместимый API), любой кастомный промпт |
+| 🗄 **SQLite-база** | Шаблоны, кэш и история диалогов сохраняются навсегда |
+| 🛠 **Кастомные шаблоны** | `/add_template ID \| Название \| Промпт` |
+| 💬 **Чат с ИИ** | Свободное общение с моделью по полученному контексту |
+| 🩺 **Health-check** | Фиктивный HTTP-сервер на `/health` для Free Web Service |
 
-## 🛠 Архитектурная схема работы
+---
 
-```mermaid
-flowchart TD
-    User([Пользователь]) <-->|Голос / Файл / YouTube Ссылка| TG[Telegram Bot API]
-    TG <-->|python-telegram-bot| Code[Наш Python-скрипт]
+## 🚀 Быстрый старт
 
-    subgraph "Локальный Аудиодекодер"
-        Code -->|pydub + ffmpeg| Conv[Конвертация в WAV]
-        Conv -->|SpeechRecognition| Speech[Google Speech API]
-        Speech -->|Текст| Code
-    end
+### Локально
 
-    subgraph "Парсинг YouTube"
-        Code -->|youtube-transcript-api| YT[YouTube HTML/Subtitles]
-        YT -->|Субтитры| Code
-    end
+```bash
+git clone https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot.git
+cd AI-Summary-YT-Voice-Agent-Bot
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
 
-    subgraph "ИИ-Интеграция (LLM)"
-        Code <-->|REST API + Bearer Token| LLM[OpenAI / DeepSeek / local Ollama]
-    end
+# macOS: brew install ffmpeg   # Linux: sudo apt install ffmpeg
 
-    subgraph "SQLite База Данных (v2.0.0)"
-        Code -->|Сохранение/Чтение| DB[(bot_database.db)]
-        DB -->|Шаблоны пользователей| Code
-        DB -->|Кэш YouTube| Code
-        DB -->|История чата| Code
-    end
+export TELEGRAM_BOT_TOKEN="токен_бота"
+export AI_API_KEY="ключ_openrouter"
+export AI_API_URL="https://openrouter.ai/api/v1"
+export AI_MODEL="openai/gpt-4o-mini"
+
+python bot.py
 ```
 
+### На Render (Web Service, Free)
+
+Проект задеплоен как **Web Service** с фиктивным HTTP-сервером на `$PORT` и путём `/health` — это позволяет держать бота на бесплатном тарифе. Сам бот работает через `run_polling()`.
+
+Подробности и список env-переменных — в [`DEPLOY.md`](DEPLOY.md).
+
+> ⚠️ **Про засыпание:** Free Web Service усыпает после ~15 минут без HTTP-трафика. Чтобы бот был в сети 24/7, настрой бесплатный **UptimeRobot**-монитор на `https://ai-summary-yt-voice-agent-bot-ir8e.onrender.com/health` с интервалом 10–13 минут.
+
 ---
 
-📋 Системные требования и зависимости
-Для работы аудиоконвертера в вашей операционной системе должна быть установлена утилита FFmpeg:
+## 📁 Структура проекта
 
-Ubuntu/Debian: sudo apt update && sudo apt install ffmpeg
-macOS: brew install ffmpeg
-Windows: Скачайте бинарный файл с официального сайта FFmpeg и добавьте путь к нему в переменные окружения PATH.
-⚙️ Установка и запуск
-Склонируйте репозиторий:
+```
+.
+├── bot.py              # 🌟 основной код (PEP8, модульная архитектура)
+├── Dockerfile          # образ с FFmpeg
+├── render.yaml         # Blueprint-конфиг для Render
+├── requirements.txt   # зависимости Python
+├── DEPLOY.md          # подробная инструкция по деплою
+├── README.md          # этот файл
+├── .gitignore         # что не коммитим
+├── .dockerignore      # что не попадает в образ
+├── LICENSE            # MIT
+└── legacy/            # 📦 старые версии (история, не удаляются)
+    ├── advanced_voice_yt_bot.py          # v1.x
+    ├── advanced_voice_yt_bot_v2.py       # v2.x
+    └── advanced_voice_yt_bot_v2.1_db.py  # v2.1 с БД
+```
 
-git clone <https://github.com/your-username/advanced-voice-yt-bot.git>
-cd advanced-voice-yt-bot
-Установите зависимости:
+> В `bot.py` код разбит на модульные классы: `BotDatabase` (работа с БД), `LLMClient` (обращение к LLM), `AdvancedMediaYTAgentBot` (бизнес-логика/обработчики). Старые монолитные версии переехали в `legacy/`.
 
-pip install -r requirements.txt
-Задайте переменные окружения и запустите бота:
+---
 
-Для OpenAI:
+## 🏷 Управление версиями
 
-export TELEGRAM_BOT_TOKEN="ваш_то...ther"
-export AI_PROVIDER="openai"
-export AI_API_KEY="ваш_ap...enai"
-export AI_MODEL="gpt-4o-mini"
-export DB_PATH="bot_database.db"  # опционально, по умолчанию "bot_database.db"
-python advanced_voice_yt_bot_v2_db.py
-Для локальной Ollama:
+- Текущая версия: **v3.0.0**
+- Версия задаётся в `bot.py` (`__version__` и `VERSION_STRING`)
+- Релизы помечаются **git-тегами**: `git tag v3.0.0`
 
-export TELEGRAM_BOT_TOKEN="ваш_то...ther"
-export AI_PROVIDER="ollama"
-export AI_API_KEY="any_no...ring"
-export AI_API_URL="<http://localhost:11434/v1>"
-export AI_MODEL="llama3"
-export DB_PATH="bot_database.db"  # опционально, по умолчанию "bot_database.db"
-python advanced_voice_yt_bot_v2_db.py
-Управление кастомными шаблонами
-После запуска бота вы можете создавать свои шаблоны переработки:
+История версий:
 
-/add_template ID | Название | Промпт
-Пример:
+| Версия | Изменения |
+|--------|-----------|
+| **v3.0.0** | PEP8-рефакторинг, модульные классы, фикс `/var/data`, health-check сервер |
+| **v2.1** | SQLite-база: шаблоны, кэш YouTube, история диалогов |
+| **v2.0** | Асинхронная версия (aiogram → python-telegram-bot v20) |
+| **v1.x** | Синхронный прототип |
 
-/add_template 5 | Мой переводчик | Переведи текст на английский язык.
-Где:
+---
 
-ID — уникальный идентификатор вашего шаблона (можно использовать числа или строки)
-Название — отображаемое имя в меню выбора шаблона
-Промпт — инструкция для ИИ, как обрабатывать текст
+## 🗺 Roadmap
 
-📄 Лицензия
-Этот проект распространяется под лицензией MIT. Подробности см. в файле LICENSE.
+| Версия | Что планируется |
+|--------|----------------|
+| **v8.0.0** | Мультимодальный ввод: OCR для изображений/PDF → суммаризация текста из сканов |
+| **v9.0.0** | Персонализированные модели: дообучение Whisper и LLM на данных конкретного пользователя (с согласием + шифрование) |
+| **v10.0.0** | Социальный слой: публичные каналы саммари, голосование за полезность |
+| **v11.0.0** | Автопланирование: бот предлагает календарные события на основе извлечённых экшен-планов (интеграция с Google Calendar/Outlook) |
+| **v12.0.0** | Edge-развёртывание: версия для работы на Raspberry Pi / Jetson Nano (полностью офлайн) |
+
+---
+
+## 📜 Лицензия
+
+MIT — подробности в [`LICENSE`](LICENSE).
+
+---
+
+<div align="center">
+
+**Автор:** [affigeny](https://github.com/affigeny) · Сделано для собственного EdTech-проекта и демонстрации AI-навыков
+
+</div>
