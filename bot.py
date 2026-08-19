@@ -34,7 +34,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
-__version__ = "4.3.1"
+__version__ = "4.3.4"
 VERSION_STRING = __version__  # Keep in sync
 
 import aiohttp
