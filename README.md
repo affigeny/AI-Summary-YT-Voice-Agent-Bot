@@ -1,124 +1,165 @@
-# 🤖 YT_Bot_Sum
+# YT_Bot_Sum
 
-Telegram‑бот, который принимает **YouTube‑ссылки, голосовые сообщения и аудиофайлы**, извлекает из них смысл (субтитры или распознавание речи) и перерабатывает через LLM (OpenRouter) по выбранному шаблону.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-blue.svg)](https://t.me/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/tag/affigeny/YT_Bot_Sum)](https://github.com/affigeny/YT_Bot_Sum/tags)
+[![Render](https://img.shields.io/badge/Deploy-Render-EBFF71?logo=render)](https://render.com)
 
-## ✨ Возможности
+Telegram-бот для извлечения и суммаризации контента из YouTube-видео, голосовых сообщений и аудиофайлов. Распознаёт речь локально через Whisper, перерабатывает текст через LLM (OpenRouter) по выбранным шаблонам.
+
+## 🚀 Возможности
 
 | Возможность | Описание |
 |-------------|----------|
-| 📹 **YouTube/Shorts** | Умное извлечение субтитров (ручные → авто, любые языки) → суммаризация. Если субтитры недоступны, бот скачивает аудио и распознаёт его через локальную модель Whisper. |
-| 🎙 **Голосовые / аудио** | Распознавание речи через **faster-whisper** (модель `small` по‑умолчанию) → текст → суммаризация. |
-| 🤖 **LLM‑переработка** | OpenRouter (OpenAI‑совместимый API). По умолчанию используется `nvidia/nemotron-3-super-120b-a12b:free`. |
-| 🗄 **SQLite‑база** | Хранение шаблонов, кэша YouTube, истории диалогов и LRU‑кеша ответов LLM. |
-| 🛠 **Кастомные шаблоны** | `/add_template ID \| Название \| Промпт` – сохранить собственный промпт. |
-| 💬 **Чат с ИИ** | Свободное общение с моделью по полученному контексту (например, задать уточняющие вопросы). |
-| 🩺 **Health‑check** | Простой HTTP‑сервер на `$PORT` → `/health` возвращает `200 OK`, чтобы Render не «засыпал» на бесплатном тарифе. |
-| ❓ **Помощь** | `/help` – выводит список доступных команд. |
+| 📹 **YouTube / Shorts** | Извлечение субтитров (включая автогенерацию) через `yt-dlp` с browser-like headers. Fallback: скачивание аудио → локальное распознавание через Whisper. |
+| 🎙 **Голосовые / аудио** | Поддержка голосовых сообщений Telegram и аудиофайлов (mp3, wav, m4a, ogg). Распознавание через `faster-whisper` (модель `small` по умолчанию). |
+| 🤖 **LLM-переработка** | Интеграция с OpenRouter (OpenAI-совместимый API). Дефолтная модель: `nvidia/nemotron-3-super-120b-a12b:free`. |
+| 🗄 **SQLite-база** | Хранение пользовательских шаблонов, кэша транскриптов, истории диалогов. |
+| 🛠 **Кастомные шаблоны** | Команда `/add_template ID | Название | Промпт` для сохранения собственных сценариев обработки. |
+| 💬 **Интерактивный чат** | Диалог с ИИ по контексту видео/аудио: уточняющие вопросы, анализ, пересказ. |
+| ⬇️ **Скачивание медиа** | Инлайн-кнопки для выбора качества видео и аудио (ограничение Telegram: ≤50 MB). |
+| 🩺 **Health-check** | Встроенный HTTP-сервер на `$PORT` (эндпоинт `/health` → `200 OK`) для обхода засыпания на Render Free. |
 
-## 🚀 Быстрый старт
+## 📦 Быстрый старт
 
-### Локально
+### Локальный запуск
+
 ```bash
+# Клонирование репозитория
 git clone https://github.com/affigeny/YT_Bot_Sum.git
 cd YT_Bot_Sum
+
+# Виртуальное окружение
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Linux/macOS
+# venv\Scripts\activate   # Windows
+
+# Установка зависимостей
 pip install -r requirements.txt
 
-# Убедитесь, что ffmpeg установлен в системе
-# macOS: brew install ffmpeg
-# Linux:  sudo apt-get install ffmpeg
+# Установка FFmpeg (обязательно для pydub)
+# macOS:
+brew install ffmpeg
+# Linux (Debian/Ubuntu):
+sudo apt-get update && sudo apt-get install -y ffmpeg
 
-export TELEGRAM_BOT_TOKEN="ВАШ_ТОКЕН_ОТ_BOTFATHER"
-export AI_API_KEY="ВАШ_КЛЮЧ_ОТ_OPENROUTER"
+# Переменные окружения
+export TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+export AI_API_KEY="sk-or-v1-..."        # OpenRouter API key
 export AI_API_URL="https://openrouter.ai/api/v1"
-export AI_MODEL="nvidia/nemotron-3-super-120b-a12b:free"   # можно задать другую модель через env
+export AI_MODEL="nvidia/nemotron-3-super-120b-a12b:free"
 export DB_PATH="./bot_database.db"
 
+# Запуск
 python bot.py
 ```
 
-### На Render (Web Service, Free)
-Репозиторий уже настроен как **Web Service** с фиктивным HTTP‑сервером на `$PORT` и эндпоинтом `/health`. Чтобы запустить:
+### Деплой на Render (бесплатный тариф)
 
-1. Форкните репозиторий (или используйте свой).
-2. В Render создайте **New Web Service**, укажите репозиторий, ветку `main`.
-3. Добавьте переменные окружения:
-   - `TELEGRAM_BOT_TOKEN`
-   - `AI_API_KEY`
-   - `AI_API_URL` (по умолчанию `https://openrouter.ai/api/v1`)
-   - `AI_MODEL` (по умолчанию `nvidia/nemotron-3-super-120b-a12b:free`)
-   - `DB_PATH` (по умолчанию `./bot_database.db`)
-4. Убедитесь, что в `render.yaml` указан `healthCheckPath: /health`.
-5. После деплоя проверьте `https://<ваш‑сервис>.onrender.com/health` → должно вернуть `200 OK`.
+Репозиторий настроен как **Web Service** с health-check (обход limit на Free tier).
 
-> **⚠️ Про засыпание:** на бесплатном тарифе Render усыпляет сервис после ~15 минут без HTTP‑трафика. Чтобы бот был постоянно в сети, настройте бесплатный **UptimeRobot** (или аналогичный сервис) на `https://<ваш‑сервис>.onrender.com/health` с интервалом 10‑13 минут.
+1. **Форкните** репозиторий или используйте свой.
+2. В панели Render: **New → Web Service** → подключите репозиторий, ветка `main`.
+3. **Environment Variables**:
+
+   | Ключ | Значение | Обязательно |
+   |------|----------|-------------|
+   | `TELEGRAM_BOT_TOKEN` | Токен от [@BotFather](https://t.me/BotFather) | ✅ |
+   | `AI_API_KEY` | Ключ OpenRouter (`sk-or-v1-...`) | ✅ |
+   | `AI_API_URL` | `https://openrouter.ai/api/v1` | ⚠️ по умолчанию |
+   | `AI_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` | ⚠️ по умолчанию |
+   | `DB_PATH` | `/var/data/bot_database.db` | ⚠️ по умолчанию |
+   | `YT_COOKIES_FILE` | Путь к cookies.txt (см. ниже) | ❌ опционально |
+   | `YT_COOKIES_FROM_BROWSER` | `chrome` / `firefox` / `safari` | ❌ опционально |
+
+4. **Secret Files** (опционально, для обхода bot-check): загрузите `cookies.txt` в `/var/data/cookies.txt`.
+5. Нажмите **Deploy** и проверьте логи.
+6. После деплоя: `https://<service>.onrender.com/health` → `{"status":"ok"}`.
+
+> **⚠️ Засыпание на Free tier:** Render усыпляет сервис после ~15 минут без трафика. Для постоянного онлайна настройте внешний мониторинг (UptimeRobot, Cron-job.org) на `/health` с интервалом 10–13 минут.
+
+## ⚙️ YouTube bot-check
+
+YouTube блокирует выкачку субтитров без авторизации: *«Sign in to confirm you're not a bot»*.
+
+Бот детектирует блокировку и:
+1. Пробует аудио-fallback (скачивание + Whisper).
+2. Если и оно заблокировано — сообщает пользователю о необходимости куки.
+
+**Обход блокировки:**
+
+```bash
+# Локально (из браузера)
+yt-dlp --cookies-from-browser chrome -o cookies.txt "https://www.youtube.com/watch?v=VIDEO_ID"
+
+# Передача в бота
+export YT_COOKIES_FILE="/path/to/cookies.txt"
+# Или (только локальный запуск, требует установленного браузера)
+export YT_COOKIES_FROM_BROWSER=chrome
+```
+
+**На Render:** загрузите `cookies.txt` через **Secret Files** → `/var/data/cookies.txt`, задайте `YT_COOKIES_FILE=/var/data/cookies.txt`.
 
 ## 📁 Структура проекта
+
 ```
 .
-├── bot.py              # 🌟 основной код (PEP8, разбито на модульные классы)
-├── Dockerfile          # образ с FFmpeg
-├── render.yaml         # Blueprint‐конфиг для Render (Web Service + health-check)
-├── requirements.txt    # зависимости Python
-├── DEPLOY.md          # подробная инструкция по деплою + обход bot-check
-├── README.md          # этот файл
-├── .gitignore         # что не коммитим
-├── .dockerignore      # что не попадает в образ
-└── LICENSE            # MIT
+├── bot.py              # Основной код (модульные классы, PEP8)
+├── Dockerfile          # Образ с FFmpeg + Python 3.11
+├── render.yaml         # Blueprint-конфиг для Render
+├── requirements.txt    # Зависимости Python
+├── DEPLOY.md           # Развёрнутая инструкция по деплою
+├── README.md           # Этот файл
+├── .gitignore          # Исключения git
+├── .dockerignore       # Исключения Docker
+└── LICENSE             # MIT License
 ```
 
-**Модульная архитектура** (`bot.py`):
-- `BotDatabase` – работа с SQLite (шаблоны, кэш, история).
-- `LLMClient` – общение с OpenRouter (поддержка кастомных моделей, streaming, LRU‑кеш).
-- `MediaBot` – обработчики Telegram (текст, голос, аудио, ссылки, инлайн‑кнопки).
-- `YTClient` – логика работы с YouTube (получение субтитров через `yt-dlp`, fallback на аудио‑распознавание).
-- `STTClient` – обёртка над `faster-whisper` (локальное распознавание речи).
+### Архитектура (`bot.py`)
 
-## 🍪 YouTube bot-check (почему иногда не качаются субтитры)
+| Класс | Назначение |
+|-------|------------|
+| `BotDatabase` | SQLite: шаблоны, кэш YouTube, история диалогов |
+| `LLMClient` | Запросы к OpenRouter (OpenAI-совместимый API) |
+| `YTClient` | `yt-dlp`: субтитры, метаданные, форматы скачивания |
+| `STTClient` | `faster-whisper`: локальное распознавание речи |
+| `MediaBot` | Обработчики Telegram: текст, голос, аудио, инлайн-кнопки |
 
-YouTube всё чаще требует авторизацию: *«Sign in to confirm you're not a bot»*.
-Бот это детектирует (`YouTubeBlockingError`) и:
-1. пробует fallback — скачать аудио и распознать через локальный Whisper;
-2. если и аудио заблокировано — честно пишет, что нужны куки.
+## 🏷 История версий
 
-**Решение — передать куки** (см. детали в `DEPLOY.md`):
-- Локально: `export YT_COOKIES_FROM_BROWSER=chrome`
-- На Render: залей `cookies.txt` через Secret Files в `/var/data/cookies.txt`
-  и задай `YT_COOKIES_FILE=/var/data/cookies.txt`.
-  Сгенерировать локально: `yt-dlp --cookies-from-browser chrome -o cookies.txt "https://youtube.com"`
+| Версия | Дата | Изменения |
+|--------|------|-----------|
+| **v4.1.4** | 2026-08-19 | Таймауты на всех асинхронных операциях; исправлен `async` вызов `_transcribe_youtube_audio`; блокировка теперь возвращает ответ за ~3 сек вместо зависания |
+| **v4.1.3** | 2026-08-19 | Исправлен `render.yaml` (указывал на неверный репозиторий); добавлена поддержка куки (`YT_COOKIES_FILE`, `YT_COOKIES_FROM_BROWSER`); обновлён `DEPLOY.md` |
+| **v4.1.2** | 2026-08-19 | Улучшен regex для YouTube-ссылок; обработка `YouTubeBlockingError`; логирование |
+| **v4.1.1** | 2026-08-18 | regex для YouTube-ссылок, улучшена структура кода |
+| **v4.1.0** | 2026-08-18 | `yt-dlp` вместо `youtube-transcript-api`; browser-like headers; устойчивость к блокировкам |
+| **v4.0.0** | 2026-08-18 | Faster-whisper (локальный STT); инлайн-кнопки; модульная архитектура |
+| **v3.0.0** | — | PEP8-рефакторинг, health-check сервер, фикс `/var/data/` |
+| **v2.1** | — | SQLite-база: шаблоны, кэш, история |
+| **v2.0** | — | Переход на `python-telegram-bot` v20 (async) |
+| **v1.x** | — | Синхронный прототип |
 
-## 🏷 Управление версиями
-- Текущая версия задаётся в `bot.py` (`__version__` и `VERSION_STRING`).
-- Релизы помечаются **git‑тегами** (`git tag vX.Y.Z`).
-- После каждого релиза пушим тег: `git push origin vX.Y.Z`.
+## 🗺 Roadmap
 
-**История версий**
-
-| Версия | Изменения |
-|--------|-----------|
-| **v4.1.2** | Исправлена работа с YouTube‑ссылками (regex), добавлена обработка ошибок и логирование во всех обработчиках; обновлён README. |
-| **v4.1.1** | Исправлен regex YouTube‑ссылок, улучшена структура кода; README с roadmap и историей версий. |
-| **v4.1.0** | Добавлена обработка ошибок и логирование; улучшена устойчивость к блокировкам YouTube (yt-dlp + browser-like заголовки). |
-| **v4.0.0** | yt-dlp вместо youtube-transcript-api, faster-whisper (локальный STT), инлайн‑кнопки с выбором разрешения/формата, очистка репозитория, обновлённый README. |
-| **v3.0.0** | PEP8‑рефакторинг, модульные классы, фикс создания директории `/var/data/`, health‑check сервер. |
-| **v2.1** | SQLite‑база: шаблоны, кэш YouTube, история диалогов. |
-| **v2.0** | Переход на `python-telegram-bot` v20 (асинхронный). |
-| **v1.x** | Синхронный прототип. |
-
-## 🗺 Roadmap (планируемые версии)
-
-| Версия | Что планируется |
-|--------|-----------------|
-| **v8.0.0** | Мультимодальный ввод: OCR для изображений/PDF → суммаризация текста из сканов. |
-| **v9.0.0** | Персонализированные модели: дообучение Whisper и LLM на данных конкретного пользователя (согласие + шифрование). |
-| **v10.0.0** | Социальный слой: публичные каналы саммари, голосование за полезность. |
-| **v11.0.0** | Автопланирование: бот предлагает календарные события на основе извлечённых экшен‑планов (интеграция с Google Calendar/Outlook). |
-| **v12.0.0** | Edge‑развёртывание: версия для работы на Raspberry Pi / Jetson Nano (полностью офлайн). |
+| Версия | Планируется |
+|--------|-------------|
+| **v5.0.0** | Стриминг ответов LLM (progressive display) |
+| **v6.0.0** | LRU-кеш ответов LLM (снижение затрат) |
+| **v7.0.0** | Мультиязычность интерфейса (i18n) |
+| **v8.0.0** | OCR для изображений/PDF → суммаризация |
+| **v9.0.0** | Персонализированные модели (fine-tune Whisper/LLM на данных пользователя) |
+| **v10.0.0** | Социальный слой: публичные каналы саммари, рейтинги |
+| **v11.0.0** | Интеграция с календарями (Google Calendar / Outlook) |
+| **v12.0.0** | Edge-деплой: Raspberry Pi / Jetson Nano (полностью офлайн) |
 
 ## 📜 Лицензия
-MIT — см. [`LICENSE`](LICENSE).
+
+[MIT License](LICENSE) — свободное использование, модификация, распределение.
 
 ---
 
-**Автор:** [affigeny](https://github.com/affigeny) – создан для собственного EdTech‑проекта и демонстрации AI‑навыков.
+**Автор:** [affigeny](https://github.com/affigeny)  
+**Создано для:** EdTech-проекта и демонстрации AI/Python навыков  
+**Проблемы / вопросы:** [GitHub Issues](https://github.com/affigeny/YT_Bot_Sum/issues)
