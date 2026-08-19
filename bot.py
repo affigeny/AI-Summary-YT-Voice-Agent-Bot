@@ -1005,18 +1005,6 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(bot.handle_callback_query))
 
-    # ========================================================================
-    # ИНТЕГРАЦИЯ: Модуль транскрибации (Буквица v2.1)
-    # ========================================================================
-    try:
-        from transcription import register_transcription_handlers
-        register_transcription_handlers(app, DB_PATH)
-        logger.info("✓ Transcription module loaded (Буквица v2.1)")
-        logger.info("✓ YouTube bypass buttons added")
-        logger.info("✓ Test mode available")
-    except Exception as e:
-        logger.warning(f"⚠ Could not load transcription module: {e}")
-
     print(f"Бот {VERSION_STRING} запущен: polling + health-check сервер.")
     app.run_polling()
 
