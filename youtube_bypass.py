@@ -24,6 +24,9 @@ YOUTUBE_BYPASS_METHODS = {
 # Текущий метод для каждого пользователя
 user_bypass_methods = {}
 
+# Callback-data prefixes, owned by youtube_bypass (used for handler routing).
+BYPASS_CALLBACK_PREFIXES = ("bypass_", "stats", "help")
+
 
 # ==================== ИСКЛЮЧЕНИЯ ====================
 class YouTubeBlockingError(Exception):
@@ -325,14 +328,30 @@ async def handle_youtube_bypass(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ==================== РЕГИСТРАЦИЯ ====================
+def get_user_method(user_id: int) -> str:
+    """Вернуть текущий метод обхода пользователя (для bot.py)."""
+    return user_bypass_methods.get(user_id, "no_cookies")
+
+
 def register_youtube_handlers(dp):
-    """Регистрация обработчиков в боте"""
-    from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, filters
-    
+    """Регистрация обработчиков в боте.
+
+    Важно: CallbackQueryHandler регистрируется с pattern-фильтром, чтобы
+    перехватывать ТОЛЬКО bypass-кнопки и не конфликтовать с основным
+    обработчиком bot.py, который слушает callback'и шаблонов/скачивания.
+    """
+    from telegram.ext import CommandHandler, CallbackQueryHandler
+    import re
+
     dp.add_handler(CommandHandler("bypass", cmd_bypass))
-    dp.add_handler(CallbackQueryHandler(cb_bypass))
-    dp.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'https?://.*youtube\.com|https?://.*youtu\.be'), handle_youtube_bypass))
-    
+    # Маршрутизируем только bypass-кнопки: bypass_*, stats, help
+    dp.add_handler(
+        CallbackQueryHandler(
+            cb_bypass,
+            pattern=re.compile(r'^(bypass_|stats$|help$)'),
+        )
+    )
+
     logger.info("✓ YouTube bypass handlers registered")
-    logger.info("✓ Commands: /bypass, YouTube links")
-    logger.info("✓ Callback queries registered")
+    logger.info("✓ Commands: /bypass, callback buttons")
+    logger.info("✓ Callback queries registered (pattern-filtered)")
