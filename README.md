@@ -59,17 +59,13 @@ python bot.py
 .
 ├── bot.py              # 🌟 основной код (PEP8, разбито на модульные классы)
 ├── Dockerfile          # образ с FFmpeg
-├── render.yaml         # Blueprint‑конфиг для Render
+├── render.yaml         # Blueprint‐конфиг для Render (Web Service + health-check)
 ├── requirements.txt    # зависимости Python
-├── DEPLOY.md          # подробная инструкция по деплою
+├── DEPLOY.md          # подробная инструкция по деплою + обход bot-check
 ├── README.md          # этот файл
 ├── .gitignore         # что не коммитим
 ├── .dockerignore      # что не попадает в образ
-├── LICENSE            # MIT
-└── legacy/            # 📦 старые версии (история, не удаляются)
-    ├── advanced_voice_yt_bot.py          # v1.x
-    ├── advanced_voice_yt_bot_v2.py       # v2.x
-    └── advanced_voice_yt_bot_v2.1_db.py  # v2.1 с БД
+└── LICENSE            # MIT
 ```
 
 **Модульная архитектура** (`bot.py`):
@@ -78,6 +74,19 @@ python bot.py
 - `MediaBot` – обработчики Telegram (текст, голос, аудио, ссылки, инлайн‑кнопки).
 - `YTClient` – логика работы с YouTube (получение субтитров через `yt-dlp`, fallback на аудио‑распознавание).
 - `STTClient` – обёртка над `faster-whisper` (локальное распознавание речи).
+
+## 🍪 YouTube bot-check (почему иногда не качаются субтитры)
+
+YouTube всё чаще требует авторизацию: *«Sign in to confirm you're not a bot»*.
+Бот это детектирует (`YouTubeBlockingError`) и:
+1. пробует fallback — скачать аудио и распознать через локальный Whisper;
+2. если и аудио заблокировано — честно пишет, что нужны куки.
+
+**Решение — передать куки** (см. детали в `DEPLOY.md`):
+- Локально: `export YT_COOKIES_FROM_BROWSER=chrome`
+- На Render: залей `cookies.txt` через Secret Files в `/var/data/cookies.txt`
+  и задай `YT_COOKIES_FILE=/var/data/cookies.txt`.
+  Сгенерировать локально: `yt-dlp --cookies-from-browser chrome -o cookies.txt "https://youtube.com"`
 
 ## 🏷 Управление версиями
 - Текущая версия задаётся в `bot.py` (`__version__` и `VERSION_STRING`).
@@ -88,8 +97,9 @@ python bot.py
 
 | Версия | Изменения |
 |--------|-----------|
-| **v4.1.1** | Исправлена работа с YouTube‑ссылками (regex), добавлена обработка ошибок и логирование во всех обработчиках; обновлён README. |
-| **v4.1.0** | Добавлена обработка ошибок и логирование; улучшена устойчивость к блокировкам YouTube. |
+| **v4.1.2** | Исправлена работа с YouTube‑ссылками (regex), добавлена обработка ошибок и логирование во всех обработчиках; обновлён README. |
+| **v4.1.1** | Исправлен regex YouTube‑ссылок, улучшена структура кода; README с roadmap и историей версий. |
+| **v4.1.0** | Добавлена обработка ошибок и логирование; улучшена устойчивость к блокировкам YouTube (yt-dlp + browser-like заголовки). |
 | **v4.0.0** | yt-dlp вместо youtube-transcript-api, faster-whisper (локальный STT), инлайн‑кнопки с выбором разрешения/формата, очистка репозитория, обновлённый README. |
 | **v3.0.0** | PEP8‑рефакторинг, модульные классы, фикс создания директории `/var/data/`, health‑check сервер. |
 | **v2.1** | SQLite‑база: шаблоны, кэш YouTube, история диалогов. |

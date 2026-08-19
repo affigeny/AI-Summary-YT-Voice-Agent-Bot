@@ -7,7 +7,7 @@ services:
   - type: web
     name: yt-bot-sum
     runtime: docker
-    repo: https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot
+    repo: https://github.com/affigeny/YT_Bot_Sum
     region: frankfurt
     branch: main
     plan: free
@@ -26,3 +26,12 @@ services:
       # AI_API_KEY задаётся вручную (секрет, не хранить в репозитории)
       - key: AI_API_KEY
         sync: false
+      # Куки YouTube для обхода bot-check (YouTube часто требует авторизацию).
+      # Вариант A: путь к файлу cookies.txt (загрузить в Render через Secret Files или
+      #   экспортировать: yt-dlp --cookies-from-browser chrome -o cookies.txt "URL").
+      #   Тогда задать YT_COOKIES_FILE=/var/data/cookies.txt
+      # Вариант B (только для локального запуска): YT_COOKIES_FROM_BROWSER=chrome
+      - key: YT_COOKIES_FILE
+        sync: false
+      - key: YT_COOKIES_FROM_BROWSER
+        value: ""

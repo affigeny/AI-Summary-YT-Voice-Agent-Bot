@@ -34,7 +34,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
-__version__ = "4.1.1"
+__version__ = "4.1.3"
 VERSION_STRING = __version__  # Keep in sync
 
 import aiohttp
@@ -68,6 +68,14 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 # Сколько секунд аудио держать в памяти для распознавания (меньше = быстрее).
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "1800"))
 
+# YouTube-куки для обхода bot-check (YouTube всё чаще требует авторизацию).
+# Вариант A: путь к файлу с куками (Netscape-формат), экспортировать через
+#   yt-dlp --cookies-from-browser chrome -o cookies.txt "URL"
+# Вариант B: имя браузера, из которого взять куки ("chrome", "firefox", "safari"...).
+#   Работает только если бот запущен на той же машине, где есть этот браузер (не на Render).
+YT_COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "")
+YT_COOKIES_FROM_BROWSER = os.getenv("YT_COOKIES_FROM_BROWSER", "")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -78,6 +86,16 @@ logger = logging.getLogger(__name__)
 class YouTubeBlockingError(Exception):
     """Исключение, возникающее при обнаружении блокировки запроса YouTube."""
     pass
+
+
+def yt_cookie_opts() -> dict:
+    """Возвращает опции yt-dlp для передачи куки (если заданы в env)."""
+    opts = {}
+    if YT_COOKIES_FILE:
+        opts["cookiefile"] = YT_COOKIES_FILE
+    if YT_COOKIES_FROM_BROWSER:
+        opts["cookiesfrombrowser"] = (YT_COOKIES_FROM_BROWSER,)
+    return opts
 
 # ---------------------------------------------------------------------------
 # Дефолтные шаблоны переработки.
@@ -314,6 +332,7 @@ class YTClient:
         yt = self._module()
         url = f"https://www.youtube.com/watch?v={video_id}"
         opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+        opts.update(yt_cookie_opts())
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
@@ -339,19 +358,33 @@ class YTClient:
                     "Referer": "https://www.youtube.com/",
                 },
             }
+            opts.update(yt_cookie_opts())
             try:
                 with yt.YoutubeDL(opts) as ydl:
                     ydl.download([url])
             except Exception as e:
-                # Проверяем, является ли ошибка блокировкой
                 err_str = str(e).lower()
-                if any(code in err_str for code in ("429", "403")) or "too many requests" in err_str or "blocked" in err_str:
+                # YouTube bot-check: "Sign in to confirm you're not a bot".
+                if (
+                    "confirm you" in err_str
+                    or "not a bot" in err_str
+                    or "sign in" in err_str
+                    or "cookies" in err_str
+                    or "429" in err_str
+                    or "403" in err_str
+                    or "too many requests" in err_str
+                    or "blocked" in err_str
+                ):
                     raise YouTubeBlockingError(
-                        "YouTube блокирует запрос. Пожалуйста, попробуйте позже или используйте другое видео."
+                        "YouTube требует подтверждения, что вы не бот "
+                        "(bot-check), и блокирует выкачку субтитров.\n"
+                        "Чтобы это обойти, задайте куки: переменная "
+                        "YT_COOKIES_FILE (путь к cookies.txt) или "
+                        "YT_COOKIES_FROM_BROWSER (chrome/firefox/safari).\n"
+                        "Подробнее: https://github.com/yt-dlp/yt-dlp/wiki/FAQ"
                     )
-                else:
-                    logger.error(f"YT subtitle download failed: {e}")
-                    return ""
+                logger.error("YT subtitle download failed: %s", e)
+                return ""
 
             # Список загруженных .vtt-файлов
             subtitle_files = [
@@ -360,6 +393,7 @@ class YTClient:
                 if f.endswith(".vtt")
             ]
             if not subtitle_files:
+                # Если файлов нет — вероятно, видео без субтитров (не блокировка).
                 return ""
 
             # Извлекаем язык из имени файла
@@ -392,7 +426,7 @@ class YTClient:
                 if stripped.startswith("<!DOCTYPE html>") or "<html" in stripped.lower():
                     raise YouTubeBlockingError(
                         "YouTube возвращает HTML-страницу ошибки (возможно, блокировка). "
-                        "Пожалуйста, попробуйте позже или используйте другое видео."
+                        "Пожалуйста, попробуйте позже или задайте куки (YT_COOKIES_FILE)."
                     )
 
                 # Обрабатываем VTT‑контент (удаляем таймкоды и служебные строки)
@@ -468,6 +502,7 @@ class YTClient:
             "outtmpl": os.path.join(dest_dir, "%(title).80s.%(ext)s"),
             "noplaylist": True,
         }
+        opts.update(yt_cookie_opts())
         with yt.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return ydl.prepare_filename(info)
@@ -593,12 +628,28 @@ class MediaBot:
                 status = await update.message.reply_text(
                     "\\U0001F4E5 Извлекаю видео и субтитры..."
                 )
+                transcript = None
+                blocked = False
                 try:
                     transcript = await self._run_sync(
                         self.yt.fetch_subtitles, video_id
                     )
                 except YouTubeBlockingError as e:
-                    await status.edit_text(f"\\u26a0\\ufe0f {e}")
+                    # Субтитры заблокированы bot-check → пробуем аудио-fallback.
+                    await status.edit_text(
+                        "\\U0001F3A7 Субтитры заблокированы YouTube — "
+                        "пробую скачать аудио и распознать речь (Whisper)..."
+                    )
+                    try:
+                        transcript = await self._transcribe_youtube_audio(video_id)
+                    except YouTubeBlockingError:
+                        blocked = True
+                if blocked:
+                    await status.edit_text(
+                        "\\u26a0\\ufe0f YouTube блокирует выкачку (bot-check). "
+                        "Задайте куки: YT_COOKIES_FILE (cookies.txt) или "
+                        "YT_COOKIES_FROM_BROWSER (chrome/firefox/safari)."
+                    )
                     return
                 if not transcript:
                     # Нет субтитров → пробуем скачать аудио и распознать локально.
@@ -651,7 +702,10 @@ class MediaBot:
                 pass  # если даже не удалось отправить, просто логгируем
 
     async def _transcribe_youtube_audio(self, video_id: str) -> str:
-        """Скачивает аудио и распознаёт локально (fallback без субтитров)."""
+        """Скачивает аудио и распознаёт локально (fallback без субтитров).
+
+        Пробрасывает YouTubeBlockingError, если выкачка аудио тоже заблокирована.
+        """
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 path = await self._run_sync(
@@ -660,6 +714,8 @@ class MediaBot:
                 if not os.path.exists(path):
                     return ""
                 return await self._run_sync(self.stt.transcribe_file, path)
+        except YouTubeBlockingError:
+            raise
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка распознавания аудио YT: %s", exc)
             return ""

@@ -1,4 +1,3 @@
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -6,20 +5,17 @@ __pycache__/
 .venv/
 venv/
 env/
-
-# Секреты
 .env
 SECRETS.env
-
-# База данных (создаётся в рантайме)
 *.db
 *.db-journal
 *.sqlite3
-
-# Логи
 *.log
-
-# ОС / IDE
 .DS_Store
 .idea/
 .vscode/
+logs/
+# Временные артефакты
+transcript_*.txt
+cookies*.txt
+test.db
