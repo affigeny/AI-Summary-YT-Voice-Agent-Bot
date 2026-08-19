@@ -1,5 +1,4 @@
-"""
-YT_Bot_Sum — YouTube/voice summarizer bot.
+"""YT_Bot_Sum — YouTube/voice summarizer bot.
 
 Принимает:
   - ссылку YouTube / Shorts;
@@ -75,41 +74,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Исключение для обнаружения блокировки YouTube
+class YouTubeBlockingError(Exception):
+    """Исключение, возникающее при обнаружении блокировки запроса YouTube."""
+    pass
 
 # ---------------------------------------------------------------------------
 # Дефолтные шаблоны переработки.
 # ---------------------------------------------------------------------------
 DEFAULT_TEMPLATES = {
     "1": {
-        "name": "\U0001F4DD Краткое саммари",
+        "name": "\\U0001F4DD Краткое саммари",
         "prompt": (
             "Сделай краткую выжимку (summary) следующего текста в виде "
             "маркированного списка ключевых мыслей и выводов. Пиши на русском."
         ),
     },
     "2": {
-        "name": "\U0001F4CA Пирамида Минто",
+        "name": "\\U0001F4CA Пирамида Минто",
         "prompt": (
             "Переработай текст по принципу Пирамиды Минто: сначала главное "
             "утверждение, затем ключевые аргументы/подпункты. Пиши на русском."
         ),
     },
     "3": {
-        "name": "\u2705 Экшен-план (Action Items)",
+        "name": "\\u2705 Экшен-план (Action Items)",
         "prompt": (
             "Выдели из текста только конкретные задачи, действия, шаги и "
             "договорённости (Action Items) в виде чек-листа. Пиши на русском."
         ),
     },
     "4": {
-        "name": "\U0001F393 Подробный конспект",
+        "name": "\\U0001F393 Подробный конспект",
         "prompt": (
             "Составь подробный учебный/аналитический конспект: логические разделы "
             "с заголовками, важные термины и инсайты. Пиши на русском."
         ),
     },
 }
-
 
 # ---------------------------------------------------------------------------
 # База данных.
@@ -224,7 +226,6 @@ class BotDatabase:
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка записи в кэш YT: %s", exc)
 
-
 # ---------------------------------------------------------------------------
 # LLM-клиент.
 # ---------------------------------------------------------------------------
@@ -238,7 +239,7 @@ class LLMClient:
 
     async def complete(self, prompt: str, context_text: str, history=None, retries=3):
         if not self.api_key:
-            return "\u26a0\ufe0f Ошибка: API ключ для нейросети не настроен."
+            return "\\u26a0\\ufe0f Ошибка: API ключ для нейросети не настроен."
 
         headers = {
             "Content-Type": "application/json",
@@ -258,7 +259,7 @@ class LLMClient:
                 {
                     "role": "user",
                     "content": (
-                        "Вот исходный текст/транскрипт для контекста:\n\n"
+                        "Вот исходный текст/транскрипт для контекста:\\n\\n"
                         f"{context_text}"
                     ),
                 }
@@ -288,10 +289,9 @@ class LLMClient:
                 await asyncio.sleep((attempt + 1) * 2)
 
         return (
-            "\u26a0\ufe0f Облачный ИИ сейчас недоступен. "
+            "\\u26a0\\ufe0f Облачный ИИ сейчас недоступен. "
             "Пожалуйста, повторите попытку позже."
         )
-
 
 # ---------------------------------------------------------------------------
 # YouTube-клиент (yt-dlp).
@@ -318,65 +318,118 @@ class YTClient:
             return ydl.extract_info(url, download=False)
 
     def fetch_subtitles(self, video_id: str) -> str:
-        """Возвращает текст субтитров (ru → en → авто), либо пустую строку."""
+        """Возвращает текст субтитров (ru → en → авто), либо пустую строку.
+        Raises YouTubeBlockingError if YouTube blocks the request.
+        """
         yt = self._module()
         url = f"https://www.youtube.com/watch?v={video_id}"
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": ["ru", "en"],
-            "subtitlesformat": "vtt",
-        }
-        with yt.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if not info:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,   # мы хотим только субтитры
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["ru", "en"],
+                "subtitlesformat": "vtt",
+                "outtmpl": os.path.join(tmpdir, "%(title).80s.%(ext)s"),
+                # Имитируем браузер, чтобы уменьшить шансы блокировки
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Referer": "https://www.youtube.com/",
+                },
+            }
+            try:
+                with yt.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+            except Exception as e:
+                # Проверяем, является ли ошибка блокировкой
+                err_str = str(e).lower()
+                if any(code in err_str for code in ("429", "403")) or "too many requests" in err_str or "blocked" in err_str:
+                    raise YouTubeBlockingError(
+                        "YouTube блокирует запрос. Пожалуйста, попробуйте позже или используйте другое видео."
+                    )
+                else:
+                    logger.error(f"YT subtitle download failed: {e}")
+                    return ""
+
+            # Список загруженных .vtt-файлов
+            subtitle_files = [
+                os.path.join(tmpdir, f)
+                for f in os.listdir(tmpdir)
+                if f.endswith(".vtt")
+            ]
+            if not subtitle_files:
+                return ""
+
+            # Извлекаем язык из имени файла
+            def _lang_from_name(path: str):
+                base = os.path.basename(path)
+                name = base[:-4]  # без .vtt
+                m = re.search(r'[_-]([a-z]{2})(?:[_-]|$)', name)
+                return m.group(1) if m else None
+
+            # Оценка приоритета: 0 - ru, 1 - en, 2 - другой
+            def _score(path: str):
+                lang = _lang_from_name(path) or ""
+                if lang == "ru":
+                    return 0
+                if lang == "en":
+                    return 1
+                return 2
+
+            subtitle_files.sort(key=_score)
+
+            for sub_path in subtitle_files:
+                try:
+                    with open(sub_path, "r", encoding="utf-8") as f:
+                        vtt_content = f.read()
+                except Exception:
+                    continue
+
+                # Если получено HTML-сообщение об ошибке — считаем это блокировкой
+                stripped = vtt_content.strip()
+                if stripped.startswith("<!DOCTYPE html>") or "<html" in stripped.lower():
+                    raise YouTubeBlockingError(
+                        "YouTube возвращает HTML-страницу ошибки (возможно, блокировка). "
+                        "Пожалуйста, попробуйте позже или используйте другое видео."
+                    )
+
+                # Обрабатываем VTT‑контент (удаляем таймкоды и служебные строки)
+                text = self._process_vtt(vtt_content)
+                if text.strip():
+                    return text
             return ""
 
-        subs = info.get("subtitles") or {}
-        auto = info.get("automatic_captions") or {}
-
-        # Приоритет: ручные ru → авто ru → ручные en → авто en → любой.
-        for source in (subs, auto):
-            for lang in ("ru", "en"):
-                entry = (source.get(lang) or [{}])[0]
-                if entry.get("url"):
-                    text = self._download_vtt(entry["url"])
-                    if text:
-                        return text
-        # Последний шанс — любой язык.
-        merged = {**subs, **auto}
-        for lang, entries in merged.items():
-            entry = (entries or [{}])[0]
-            if entry.get("url"):
-                text = self._download_vtt(entry["url"])
-                if text:
-                    return text
-        return ""
-
     @staticmethod
-    def _download_vtt(url: str) -> str:
-        """Скачивает VTT-субтитры и убирает таймкоды/служебные строки."""
-        import requests
-
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
+    def _process_vtt(vtt_text: str) -> str:
+        """Очищает raw VTT‑текст: удаляет таймкоды, служебные строки и дубли."""
         lines = []
-        for line in resp.text.splitlines():
+        for line in vtt_text.splitlines():
             stripped = line.strip()
             if not stripped or stripped == "WEBVTT" or "-->" in stripped:
                 continue
             if stripped.isdigit():
                 continue
             lines.append(stripped)
-        # Убираем дублирующиеся подряд строки.
+        # Убираем дублирующиеся подряд строки
         deduped = []
         for line in lines:
             if not deduped or deduped[-1] != line:
                 deduped.append(line)
         return " ".join(deduped)
+
+    @staticmethod
+    def _download_vtt(url: str) -> str:
+        """Скачивает VTT‑субтитры по URL и убирает таймкоды/служебные строки."""
+        import requests
+        try:
+            resp = requests.get(url, timeout=20)  # добавляем разумный таймаут
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to download VTT from {url}: {e}")
+            return ""
+        return YTClient._process_vtt(resp.text)
 
     def list_downloadable_formats(self, video_id: str) -> dict:
         """Возвращает {качество: format_id} для видео и аудио отдельно."""
@@ -395,7 +448,7 @@ class YTClient:
                     video_formats[fmt["format_id"]] = label
             elif has_audio and fmt.get("format_id") and fmt.get("abr"):
                 audio_formats[fmt["format_id"]] = (
-                    f"\U0001F3B5 {fmt.get('audio_ext', 'audio')} "
+                    f"\\U0001F3B5 {fmt.get('audio_ext', 'audio')} "
                     f"{fmt.get('abr')}kbps"
                 )
         return {
@@ -418,7 +471,6 @@ class YTClient:
         with yt.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return ydl.prepare_filename(info)
-
 
 # ---------------------------------------------------------------------------
 # Распознавание речи (faster-whisper, локально — как в Hermes).
@@ -455,7 +507,6 @@ class STTClient:
             audio.export(tf.name, format="wav")
             return self.transcribe_file(tf.name)
 
-
 # ---------------------------------------------------------------------------
 # Telegram-бот.
 # ---------------------------------------------------------------------------
@@ -463,8 +514,8 @@ class MediaBot:
     """Обработчики сообщений + инлайн-интерфейс."""
 
     YOUTUBE_ID_RE = re.compile(
-        r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:[^/\n\s]+/\S+/|"
-        r"(?:v|e(?:mbed)?)/|shorts/|\S*?[?&]v=)|youtu\.be/)"
+        r"(?:https?://)?(?:www\\.)?(?:youtube\\.com/(?:[^/\\n\\s]+/\\S+/|"
+        r"(?:v|e(?:mbed)?)/|shorts/|\\S*?[?&]v=)|youtu\\.be/)"
         r"([a-zA-Z0-9_-]{11})"
     )
 
@@ -503,12 +554,12 @@ class MediaBot:
     # -- Команды -----------------------------------------------------------
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
-            f"\U0001F680 **{VERSION_STRING}**\n\n"
-            "Пришлите YouTube-ссылку, голосовое или аудиофайл.\n"
-            "Я достану содержание и переработаю его через ИИ.\n\n"
-            "**Шаблоны:** саммари · Пирамида Минто · экшен-план · конспект.\n"
-            "**Доп. команды:**\n"
-            "\U0001F4DD `/add_template ID | Название | Промпт` — свой шаблон."
+            f"\\U0001F680 **{VERSION_STRING}**\\n\\n"
+            "Пришлите YouTube-ссылку, голосовое или аудиофайл.\\n"
+            "Я достану содержание и переработаю его через ИИ.\\n\\n"
+            "**Шаблоны:** саммари · Пирамида Минто · экшен-план · конспект.\\n"
+            "**Доп. команды:**\\n"
+            "\\U0001F4DD `/add_template ID | Название | Промпт` — свой шаблон."
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -519,7 +570,7 @@ class MediaBot:
         text = " ".join(context.args)
         if not text or "|" not in text:
             await update.message.reply_text(
-                "\u26a0\ufe0f Формат: `/add_template ID | Название | Промпт`"
+                "\\u26a0\\ufe0f Формат: `/add_template ID | Название | Промпт`"
             )
             return
         try:
@@ -528,11 +579,11 @@ class MediaBot:
                 raise ValueError("Не все поля заполнены.")
             self.db.save_template(user_id, parts[0], parts[1], parts[2])
             await update.message.reply_text(
-                f"\u2705 Шаблон *'{parts[1]}'* (ID: {parts[0]}) сохранён."
+                f"\\u2705 Шаблон *'{parts[1]}'* (ID: {parts[0]}) сохранён."
             )
         except Exception as exc:  # noqa: BLE001
             await update.message.reply_text(
-                f"\u274c Ошибка добавления шаблона: {exc}"
+                f"\\u274c Ошибка добавления шаблона: {exc}"
             )
 
     # -- Приём текста / ссылки --------------------------------------------
@@ -543,20 +594,24 @@ class MediaBot:
 
         if video_id:
             status = await update.message.reply_text(
-                "\U0001F4E5 Извлекаю видео и субтитры..."
+                "\\U0001F4E5 Извлекаю видео и субтитры..."
             )
-            transcript = await self._run_sync(
-                self.yt.fetch_subtitles, video_id
-            )
+            try:
+                transcript = await self._run_sync(
+                    self.yt.fetch_subtitles, video_id
+                )
+            except YouTubeBlockingError as e:
+                await status.edit_text(f"\\u26a0\\ufe0f {e}")
+                return
             if not transcript:
                 # Нет субтитров → пробуем скачать аудио и распознать локально.
                 await status.edit_text(
-                    "\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
+                    "\\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
                 )
                 transcript = await self._transcribe_youtube_audio(video_id)
             if not transcript:
                 await status.edit_text(
-                    "\u274c Не удалось получить содержание видео."
+                    "\\u274c Не удалось получить содержание видео."
                 )
                 return
             title = ""
@@ -570,7 +625,7 @@ class MediaBot:
                 video_id=video_id, title=title,
             )
             await status.edit_text(
-                f"\u2705 Готово:\n**{title}**\n\n{transcript[:400]}..."
+                f"\\u2705 Готово:\\n**{title}**\\n\\n{transcript[:400]}..."
             )
             await self._send_action_keyboard(update, context)
             return
@@ -578,7 +633,7 @@ class MediaBot:
         # Обычный текст → продолжение диалога с ИИ.
         session = self.user_sessions.get(user_id)
         if session and session.get("text"):
-            status = await update.message.reply_text("\U0001F916 Думаю...")
+            status = await update.message.reply_text("\\U0001F916 Думаю...")
             session["chat_history"].append({"role": "user", "content": text})
             reply = await self.llm.complete(
                 "", session["text"], session["chat_history"]
@@ -608,23 +663,23 @@ class MediaBot:
     async def handle_audio_or_voice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
-        status = await update.message.reply_text("\U0001F4E5 Обрабатываю аудио...")
+        status = await update.message.reply_text("\\U0001F4E5 Обрабатываю аудио...")
         is_voice = update.message.voice is not None
         file_obj = update.message.voice if is_voice else update.message.audio
         fmt = "ogg" if is_voice else self._fmt_from_filename(file_obj.file_name)
         tg_file = await context.bot.get_file(file_obj.file_id)
         raw = await tg_file.download_as_bytearray()
-        await status.edit_text("\U0001F399 Распознаю речь (Whisper)...")
+        await status.edit_text("\\U0001F399 Распознаю речь (Whisper)...")
         text = await self._run_sync(
             self.stt.transcribe_bytes, bytes(raw), fmt
         )
         if not text:
-            await status.edit_text("\u274c Не удалось распознать аудио.")
+            await status.edit_text("\\u274c Не удалось распознать аудио.")
             return
         user_id = update.effective_user.id
         self._set_session(user_id, text, source="audio")
         await status.edit_text(
-            f"\U0001F5E3 **Распознанный текст:**\n{text[:300]}..."
+            f"\\U0001F5E3 **Распознанный текст:**\\n{text[:300]}..."
         )
         await self._send_action_keyboard(update, context)
 
@@ -650,11 +705,11 @@ class MediaBot:
         ]
         rows.append(
             [InlineKeyboardButton(
-                "\u2b07\ufe0f Скачать видео/аудио", callback_data=self.CB_DL_MENU
+                "\\u2b07\\ufe0f Скачать видео/аудио", callback_data=self.CB_DL_MENU
             )]
         )
         await update.effective_message.reply_text(
-            "\u2699\ufe0f **Что сделать с контентом?**",
+            "\\u2699\\ufe0f **Что сделать с контентом?**",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -675,13 +730,14 @@ class MediaBot:
         if data.startswith(self.CB_SEL):
             template_id = data[len(self.CB_SEL):]
             await self._process_template(update, context, template_id)
+            return
 
     async def _process_template(self, update, context, template_id):
         user_id = update.effective_user.id
         session = self.user_sessions.get(user_id)
         if not session or not session.get("text"):
             await update.callback_query.edit_message_text(
-                "\u26a0\ufe0f Сессия устарела — отправьте ссылку/аудио заново."
+                "\\u26a0\\ufe0f Сессия устарела — отправьте ссылку/аудио заново."
             )
             return
         templates = self.db.get_templates(user_id)
@@ -689,20 +745,20 @@ class MediaBot:
         if not template:
             return
         await update.callback_query.edit_message_text(
-            f"\U0001F916 Применяю шаблон *{template['name']}*..."
+            f"\\U0001F916 Применяю шаблон *{template['name']}*..."
         )
         result = await self.llm.complete(template["prompt"], session["text"])
         session["chat_history"] = [{"role": "assistant", "content": result}]
         await self._send_long(update.callback_query.message, result)
         await update.effective_message.reply_text(
-            "\U0001F4AC Можно задать вопрос по этому контенту — просто напишите текст."
+            "\\U0001F4AC Можно задать вопрос по этому контенту — просто напишите текст."
         )
 
     async def _show_download_menu(self, update, context):
         session = self.user_sessions.get(update.effective_user.id)
         if not session or not session.get("video_id"):
             await update.callback_query.edit_message_text(
-                "\u26a0\ufe0f Скачивание доступно только для YouTube-ссылок."
+                "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
             )
             return
         video_id = session["video_id"]
@@ -712,27 +768,26 @@ class MediaBot:
             )
         except Exception as exc:  # noqa: BLE001
             await update.callback_query.edit_message_text(
-                f"\u274c Не удалось получить форматы: {exc}"
+                f"\\u274c Не удалось получить форматы: {exc}"
             )
             return
         rows = []
         # Видео-форматы по убыванию разрешения.
         video_ids = sorted(
             fmts["video"].items(),
-            key=lambda kv: int(kv[1].replace("p", "") or 0)
-            if kv[1].replace("p", "").isdigit() else 0,
+            key=lambda kv: int(kv[1].replace("p", "")) if kv[1].replace("p", "").isdigit() else 0,
             reverse=True,
         )
         for fid, label in video_ids:
             rows.append([InlineKeyboardButton(
-                f"\U0001F3A5 {label}", callback_data=f"{self.CB_DL_VIDEO}{fid}"
+                f"\\U0001F3A5 {label}", callback_data=f"{self.CB_DL_VIDEO}{fid}"
             )])
         for fid, label in fmts["audio"].items():
             rows.append([InlineKeyboardButton(
                 label, callback_data=f"{self.CB_DL_AUDIO}{fid}"
             )])
         await update.callback_query.edit_message_text(
-            "\u2b07\ufe0f **Выберите формат для скачивания:**",
+            "\\u2b07\\ufe0f **Выберите формат для скачивания:**",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -740,7 +795,7 @@ class MediaBot:
         session = self.user_sessions.get(update.effective_user.id)
         if not session or not session.get("video_id"):
             await update.callback_query.edit_message_text(
-                "\u26a0\ufe0f Скачивание доступно только для YouTube-ссылок."
+                "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
             )
             return
         if data.startswith(self.CB_DL_VIDEO):
@@ -750,7 +805,7 @@ class MediaBot:
             fmt_id = data[len(self.CB_DL_AUDIO):]
             format_spec = fmt_id
         await update.callback_query.edit_message_text(
-            "\u23f3 Скачиваю файл..."
+            "\\u23f3 Скачиваю файл..."
         )
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -760,7 +815,7 @@ class MediaBot:
                 size = os.path.getsize(path) if os.path.exists(path) else 0
                 if size > 45 * 1024 * 1024:  # лимит Telegram ~50 МБ
                     await update.callback_query.edit_message_text(
-                        "\u26a0\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
+                        "\\u26a0\\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
                         "Выберите качество ниже или аудио."
                     )
                     return
@@ -769,18 +824,17 @@ class MediaBot:
                         chat_id=update.effective_chat.id, document=fh
                     )
                 await update.callback_query.edit_message_text(
-                    "\u2705 Файл отправлен."
+                    "\\u2705 Файл отправлен."
                 )
         except Exception as exc:  # noqa: BLE001
             await update.callback_query.edit_message_text(
-                f"\u274c Ошибка скачивания: {exc}"
+                f"\\u274c Ошибка скачивания: {exc}"
             )
 
     async def _send_long(self, message, text):
         """Отправляет длинный текст кусками по 4000 символов."""
         for idx in range(0, len(text), 4000):
             await message.reply_text(text[idx:idx + 4000])
-
 
 # ---------------------------------------------------------------------------
 # Фейковый HTTP-сервер (для Render Free Web Service).
@@ -803,7 +857,6 @@ def run_health_server(port: int):
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info("Health-check сервер слушает порт %s", port)
     server.serve_forever()
-
 
 def main() -> None:
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
@@ -829,7 +882,6 @@ def main() -> None:
 
     print(f"Бот {VERSION_STRING} запущен: polling + health-check сервер.")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
