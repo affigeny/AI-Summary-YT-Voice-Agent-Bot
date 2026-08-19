@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
 __version__ = "4.1.1"
-VERSION_STRING = "v4.1.0"
+VERSION_STRING = __version__  # Keep in sync
 
 import aiohttp
 from pydub import AudioSegment
@@ -513,11 +513,7 @@ class STTClient:
 class MediaBot:
     """Обработчики сообщений + инлайн-интерфейс."""
 
-    YOUTUBE_ID_RE = re.compile(
-        r"(?:https?://)?(?:www\\.)?(?:youtube\\.com/(?:[^/\\n\\s]+/\\S+/|"
-        r"(?:v|e(?:mbed)?)/|shorts/|\\S*?[?&]v=)|youtu\\.be/)"
-        r"([a-zA-Z0-9_-]{11})"
-    )
+    YOUTUBE_ID_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})")
 
     # Значения callback_data.
     CB_SEL = "tmpl_"      # выбрать шаблон
@@ -817,7 +813,7 @@ class MediaBot:
             await update.callback_query.edit_message_text(
                 "\\u2b07\\ufe0f **Выберите формат для скачивания:**",
                 reply_markup=InlineKeyboardMarkup(rows),
-        )
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в _show_download_menu")
             try:
