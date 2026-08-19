@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Потом код
 COPY bot.py .
+COPY youtube_bypass.py .
+COPY transcription.py .
+COPY checkpoint_manager.py .
 
 # Запуск бота (polling + фиктивный health-check сервер на $PORT)
 CMD ["python", "bot.py"]
