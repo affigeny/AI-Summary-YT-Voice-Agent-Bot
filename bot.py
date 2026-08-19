@@ -55,7 +55,7 @@ from telegram.ext import (
 import yt_transcript
 from youtube_bypass import handle_bypass_callback, register_bypass_command
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 VERSION_STRING = __version__
 
 # ---------------------------------------------------------------------------
@@ -960,7 +960,10 @@ class MediaBot:
 
     async def _transcribe_youtube_audio(self, status, video_id: str) -> str:
         """Fallback: скачать аудио (TV-клиент → web → куки) и распознать."""
-        for client, use_cookies in (("tv", False), (None, False), (None, True)):
+        for client, use_cookies in (
+            ("android_vr", False), ("tv", False), ("mweb", False),
+            (None, False), (None, True),
+        ):
             if use_cookies and not yt_transcript.get_cookies_file():
                 continue
             try:
