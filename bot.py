@@ -61,8 +61,10 @@ AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-4o-mini")
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Модель локального распознавания речи (скачивается при первом запуске).
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+# Модель локального распознавания речи (faster-whisper).
+# "small" — баланс точности и размера (~460 МБ, помещается в Free Render).
+# Для продуктива: "large-v3-turbo" (задаётся через env, требует больше памяти).
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 
 # Сколько секунд аудио держать в памяти для распознавания (меньше = быстрее).
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "1800"))
