@@ -102,28 +102,28 @@ def yt_cookie_opts() -> dict:
 # ---------------------------------------------------------------------------
 DEFAULT_TEMPLATES = {
     "1": {
-        "name": "\\U0001F4DD Краткое саммари",
+        "name": "\U0001F4DD Краткое саммари",
         "prompt": (
             "Сделай краткую выжимку (summary) следующего текста в виде "
             "маркированного списка ключевых мыслей и выводов. Пиши на русском."
         ),
     },
     "2": {
-        "name": "\\U0001F4CA Пирамида Минто",
+        "name": "\U0001F4CA Пирамида Минто",
         "prompt": (
             "Переработай текст по принципу Пирамиды Минто: сначала главное "
             "утверждение, затем ключевые аргументы/подпункты. Пиши на русском."
         ),
     },
     "3": {
-        "name": "\\u2705 Экшен-план (Action Items)",
+        "name": "\u2705 Экшен-план (Action Items)",
         "prompt": (
             "Выдели из текста только конкретные задачи, действия, шаги и "
             "договорённости (Action Items) в виде чек-листа. Пиши на русском."
         ),
     },
     "4": {
-        "name": "\\U0001F393 Подробный конспект",
+        "name": "\U0001F393 Подробный конспект",
         "prompt": (
             "Составь подробный учебный/аналитический конспект: логические разделы "
             "с заголовками, важные термины и инсайты. Пиши на русском."
@@ -257,7 +257,7 @@ class LLMClient:
 
     async def complete(self, prompt: str, context_text: str, history=None, retries=3):
         if not self.api_key:
-            return "\\u26a0\\ufe0f Ошибка: API ключ для нейросети не настроен."
+            return "\u26a0\ufe0f Ошибка: API ключ для нейросети не настроен."
 
         headers = {
             "Content-Type": "application/json",
@@ -277,7 +277,7 @@ class LLMClient:
                 {
                     "role": "user",
                     "content": (
-                        "Вот исходный текст/транскрипт для контекста:\\n\\n"
+                        "Вот исходный текст/транскрипт для контекста:\n\n"
                         f"{context_text}"
                     ),
                 }
@@ -307,7 +307,7 @@ class LLMClient:
                 await asyncio.sleep((attempt + 1) * 2)
 
         return (
-            "\\u26a0\\ufe0f Облачный ИИ сейчас недоступен. "
+            "\u26a0\ufe0f Облачный ИИ сейчас недоступен. "
             "Пожалуйста, повторите попытку позже."
         )
 
@@ -482,7 +482,7 @@ class YTClient:
                     video_formats[fmt["format_id"]] = label
             elif has_audio and fmt.get("format_id") and fmt.get("abr"):
                 audio_formats[fmt["format_id"]] = (
-                    f"\\U0001F3B5 {fmt.get('audio_ext', 'audio')} "
+                    f"\U0001F3B5 {fmt.get('audio_ext', 'audio')} "
                     f"{fmt.get('abr')}kbps"
                 )
         return {
@@ -585,12 +585,12 @@ class MediaBot:
     # -- Команды -----------------------------------------------------------
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
-            f"\\U0001F680 **{VERSION_STRING}**\\n\\n"
-            "Пришлите YouTube-ссылку, голосовое или аудиофайл.\\n"
-            "Я достану содержание и переработаю его через ИИ.\\n\\n"
-            "**Шаблоны:** саммари · Пирамида Минто · экшен-план · конспект.\\n"
-            "**Доп. команды:**\\n"
-            "\\U0001F4DD `/add_template ID | Название | Промпт` — свой шаблон."
+            f"\U0001F680 **{VERSION_STRING}**\n\n"
+            "Пришлите YouTube-ссылку, голосовое или аудиофайл.\n"
+            "Я достану содержание и переработаю его через ИИ.\n\n"
+            "**Шаблоны:** саммари · Пирамида Минто · экшен-план · конспект.\n"
+            "**Доп. команды:**\n"
+            "\U0001F4DD `/add_template ID | Название | Промпт` — свой шаблон."
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -601,7 +601,7 @@ class MediaBot:
         text = " ".join(context.args)
         if not text or "|" not in text:
             await update.message.reply_text(
-                "\\u26a0\\ufe0f Формат: `/add_template ID | Название | Промпт`"
+                "\u26a0\ufe0f Формат: `/add_template ID | Название | Промпт`"
             )
             return
         try:
@@ -610,11 +610,11 @@ class MediaBot:
                 raise ValueError("Не все поля заполнены.")
             self.db.save_template(user_id, parts[0], parts[1], parts[2])
             await update.message.reply_text(
-                f"\\u2705 Шаблон *'{parts[1]}'* (ID: {parts[0]}) сохранён."
+                f"\u2705 Шаблон *'{parts[1]}'* (ID: {parts[0]}) сохранён."
             )
         except Exception as exc:  # noqa: BLE001
             await update.message.reply_text(
-                f"\\u274c Ошибка добавления шаблона: {exc}"
+                f"\u274c Ошибка добавления шаблона: {exc}"
             )
 
     # -- Приём текста / ссылки --------------------------------------------
@@ -626,7 +626,7 @@ class MediaBot:
 
             if video_id:
                 status = await update.message.reply_text(
-                    "\\U0001F4E5 Извлекаю видео и субтитры..."
+                    "\U0001F4E5 Извлекаю видео и субтитры..."
                 )
                 transcript = None
                 blocked = False
@@ -637,7 +637,7 @@ class MediaBot:
                 except YouTubeBlockingError as e:
                     # Субтитры заблокированы bot-check → пробуем аудио-fallback.
                     await status.edit_text(
-                        "\\U0001F3A7 Субтитры заблокированы YouTube — "
+                        "\U0001F3A7 Субтитры заблокированы YouTube — "
                         "пробую скачать аудио и распознать речь (Whisper)..."
                     )
                     try:
@@ -646,7 +646,7 @@ class MediaBot:
                         blocked = True
                 if blocked:
                     await status.edit_text(
-                        "\\u26a0\\ufe0f YouTube блокирует выкачку (bot-check). "
+                        "\u26a0\ufe0f YouTube блокирует выкачку (bot-check). "
                         "Задайте куки: YT_COOKIES_FILE (cookies.txt) или "
                         "YT_COOKIES_FROM_BROWSER (chrome/firefox/safari)."
                     )
@@ -654,12 +654,12 @@ class MediaBot:
                 if not transcript:
                     # Нет субтитров → пробуем скачать аудио и распознать локально.
                     await status.edit_text(
-                        "\\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
+                        "\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
                     )
                     transcript = await self._transcribe_youtube_audio(video_id)
                 if not transcript:
                     await status.edit_text(
-                        "\\u274c Не удалось получить содержание видео."
+                        "\u274c Не удалось получить содержание видео."
                     )
                     return
                 title = ""
@@ -673,7 +673,7 @@ class MediaBot:
                     video_id=video_id, title=title,
                 )
                 await status.edit_text(
-                    f"\\u2705 Готово:\\n**{title}**\\n\\n{transcript[:400]}..."
+                    f"\u2705 Готово:\n**{title}**\n\n{transcript[:400]}..."
                 )
                 await self._send_action_keyboard(update, context)
                 return
@@ -681,7 +681,7 @@ class MediaBot:
             # Обычный текст → продолжение диалога с ИИ.
             session = self.user_sessions.get(user_id)
             if session and session.get("text"):
-                status = await update.message.reply_text("\\U0001F916 Думаю...")
+                status = await update.message.reply_text("\U0001F916 Думаю...")
                 session["chat_history"].append({"role": "user", "content": text})
                 reply = await self.llm.complete(
                     "", session["text"], session["chat_history"]
@@ -696,7 +696,7 @@ class MediaBot:
             logger.exception("Ошибка в handle_text")
             try:
                 await update.message.reply_text(
-                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                    f"\u26a0\ufe0f Внутренняя ошибка: {e}"
                 )
             except Exception:
                 pass  # если даже не удалось отправить, просто логгируем
@@ -725,30 +725,30 @@ class MediaBot:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         try:
-            status = await update.message.reply_text("\\U0001F4E5 Обрабатываю аудио...")
+            status = await update.message.reply_text("\U0001F4E5 Обрабатываю аудио...")
             is_voice = update.message.voice is not None
             file_obj = update.message.voice if is_voice else update.message.audio
             fmt = "ogg" if is_voice else self._fmt_from_filename(file_obj.file_name)
             tg_file = await context.bot.get_file(file_obj.file_id)
             raw = await tg_file.download_as_bytearray()
-            await status.edit_text("\\U0001F399 Распознаю речь (Whisper)...")
+            await status.edit_text("\U0001F399 Распознаю речь (Whisper)...")
             text = await self._run_sync(
                 self.stt.transcribe_bytes, bytes(raw), fmt
             )
             if not text:
-                await status.edit_text("\\u274c Не удалось распознать аудио.")
+                await status.edit_text("\u274c Не удалось распознать аудио.")
                 return
             user_id = update.effective_user.id
             self._set_session(user_id, text, source="audio")
             await status.edit_text(
-                f"\\U0001F5E3 **Распознанный текст:**\\n{text[:300]}..."
+                f"\U0001F5E3 **Распознанный текст:**\n{text[:300]}..."
             )
             await self._send_action_keyboard(update, context)
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в handle_audio_or_voice")
             try:
                 await update.message.reply_text(
-                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                    f"\u26a0\ufe0f Внутренняя ошибка: {e}"
                 )
             except Exception:
                 pass
@@ -775,11 +775,11 @@ class MediaBot:
         ]
         rows.append(
             [InlineKeyboardButton(
-                "\\u2b07\\ufe0f Скачать видео/аудио", callback_data=self.CB_DL_MENU
+                "\u2b07\ufe0f Скачать видео/аудио", callback_data=self.CB_DL_MENU
             )]
         )
         await update.effective_message.reply_text(
-            "\\u2699\\ufe0f **Что сделать с контентом?**",
+            "\u2699\ufe0f **Что сделать с контентом?**",
             reply_markup=InlineKeyboardMarkup(rows),
         )
 
@@ -808,7 +808,7 @@ class MediaBot:
             session = self.user_sessions.get(user_id)
             if not session or not session.get("text"):
                 await update.callback_query.edit_message_text(
-                    "\\u26a0\\ufe0f Сессия устарела — отправьте ссылку/аудио заново."
+                    "\u26a0\ufe0f Сессия устарела — отправьте ссылку/аудио заново."
                 )
                 return
             templates = self.db.get_templates(user_id)
@@ -816,19 +816,19 @@ class MediaBot:
             if not template:
                 return
             await update.callback_query.edit_message_text(
-                f"\\U0001F916 Применяю шаблон *{template['name']}*..."
+                f"\U0001F916 Применяю шаблон *{template['name']}*..."
             )
             result = await self.llm.complete(template["prompt"], session["text"])
             session["chat_history"] = [{"role": "assistant", "content": result}]
             await self._send_long(update.callback_query.message, result)
             await update.effective_message.reply_text(
-                "\\U0001F4AC Можно задать вопрос по этому контенту — просто напишите текст."
+                "\U0001F4AC Можно задать вопрос по этому контенту — просто напишите текст."
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в _process_template")
             try:
                 await update.callback_query.edit_message_text(
-                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                    f"\u26a0\ufe0f Внутренняя ошибка: {e}"
                 )
             except Exception:
                 pass
@@ -838,7 +838,7 @@ class MediaBot:
             session = self.user_sessions.get(update.effective_user.id)
             if not session or not session.get("video_id"):
                 await update.callback_query.edit_message_text(
-                    "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
+                    "\u26a0\ufe0f Скачивание доступно только для YouTube-ссылок."
                 )
                 return
             video_id = session["video_id"]
@@ -848,7 +848,7 @@ class MediaBot:
                 )
             except Exception as exc:  # noqa: BLE001
                 await update.callback_query.edit_message_text(
-                    f"\\u274c Не удалось получить форматы: {exc}"
+                    f"\u274c Не удалось получить форматы: {exc}"
                 )
                 return
             rows = []
@@ -860,21 +860,21 @@ class MediaBot:
             )
             for fid, label in video_ids:
                 rows.append([InlineKeyboardButton(
-                    f"\\U0001F3A5 {label}", callback_data=f"{self.CB_DL_VIDEO}{fid}"
+                    f"\U0001F3A5 {label}", callback_data=f"{self.CB_DL_VIDEO}{fid}"
                 )])
             for fid, label in fmts["audio"].items():
                 rows.append([InlineKeyboardButton(
                     label, callback_data=f"{self.CB_DL_AUDIO}{fid}"
                 )])
             await update.callback_query.edit_message_text(
-                "\\u2b07\\ufe0f **Выберите формат для скачивания:**",
+                "\u2b07\ufe0f **Выберите формат для скачивания:**",
                 reply_markup=InlineKeyboardMarkup(rows),
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в _show_download_menu")
             try:
                 await update.callback_query.edit_message_text(
-                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                    f"\u26a0\ufe0f Внутренняя ошибка: {e}"
                 )
             except Exception:
                 pass
@@ -884,7 +884,7 @@ class MediaBot:
             session = self.user_sessions.get(update.effective_user.id)
             if not session or not session.get("video_id"):
                 await update.callback_query.edit_message_text(
-                    "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
+                    "\u26a0\ufe0f Скачивание доступно только для YouTube-ссылок."
                 )
                 return
             if data.startswith(self.CB_DL_VIDEO):
@@ -894,7 +894,7 @@ class MediaBot:
                 fmt_id = data[len(self.CB_DL_AUDIO):]
                 format_spec = fmt_id
             await update.callback_query.edit_message_text(
-                "\\u23f3 Скачиваю файл..."
+                "\u23f3 Скачиваю файл..."
             )
             try:
                 with tempfile.TemporaryDirectory() as tmp:
@@ -904,7 +904,7 @@ class MediaBot:
                     size = os.path.getsize(path) if os.path.exists(path) else 0
                     if size > 45 * 1024 * 1024:  # лимит Telegram ~50 МБ
                         await update.callback_query.edit_message_text(
-                            "\\u26a0\\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
+                            "\u26a0\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
                             "Выберите качество ниже или аудио."
                         )
                         return
@@ -913,17 +913,17 @@ class MediaBot:
                             chat_id=update.effective_chat.id, document=fh
                         )
                     await update.callback_query.edit_message_text(
-                        "\\u2705 Файл отправлен."
+                        "\u2705 Файл отправлен."
                     )
             except Exception as exc:  # noqa: BLE001
                 await update.callback_query.edit_message_text(
-                    f"\\u274c Ошибка скачивания: {exc}"
+                    f"\u274c Ошибка скачивания: {exc}"
                 )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в _do_download")
             try:
                 await update.callback_query.edit_message_text(
-                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                    f"\u26a0\ufe0f Внутренняя ошибка: {e}"
                 )
             except Exception:
                 pass
