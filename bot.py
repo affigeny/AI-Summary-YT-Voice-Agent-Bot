@@ -1,5 +1,5 @@
 """
-Advanced Media / YouTube / Voice AI Agent Bot.
+YT_Bot_Sum — YouTube/voice summarizer bot.
 
 Принимает:
   - ссылку YouTube / Shorts;

@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🤖 AI Summary YT Voice Agent Bot
+# 🤖 YT_Bot_Sum
 
 **Принимает** YouTube-ссылки · голосовые · аудиофайлы<br>
 **Извлекает** транскрипт → **перерабатывает** через LLM (OpenRouter)<br>
@@ -33,8 +33,8 @@
 ### Локально
 
 ```bash
-git clone https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot.git
-cd AI-Summary-YT-Voice-Agent-Bot
+git clone https://github.com/affigeny/YT_Bot_Sum.git
+cd YT_Bot_Sum
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
@@ -54,7 +54,7 @@ python bot.py
 
 Подробности и список env-переменных — в [`DEPLOY.md`](DEPLOY.md).
 
-> ⚠️ **Про засыпание:** Free Web Service усыпает после ~15 минут без HTTP-трафика. Чтобы бот был в сети 24/7, настрой бесплатный **UptimeRobot**-монитор на `https://ai-summary-yt-voice-agent-bot-ir8e.onrender.com/health` с интервалом 10–13 минут.
+> ⚠️ **Про засыпание:** Free Web Service усыпает после ~15 минут без HTTP-трафика. Чтобы бот был в сети 24/7, настрой бесплатный **UptimeRobot**-монитор на `https://yt-bot-sum.onrender.com/health` с интервалом 10–13 минут.
 
 ---
 

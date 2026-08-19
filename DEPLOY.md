@@ -21,7 +21,7 @@
 ### Вариант B — вручную (если Blueprint не цепляется)
 
 1. **New + → Background Worker**
-2. **Repo**: `https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot`
+2. **Repo**: `https://github.com/affigeny/YT_Bot_Sum`
 3. **Runtime**: Docker
 4. **Env vars** (Environment → Environment Variables):
    - `TELEGRAM_BOT_TOKEN` = твой токен

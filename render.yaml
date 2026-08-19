@@ -5,7 +5,7 @@
 # ВАЖНО: секреты (token/key) задаются в панели Render, НЕ в этом файле.
 services:
   - type: web
-    name: ai-summary-bot
+    name: yt-bot-sum
     runtime: docker
     repo: https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot
     region: frankfurt
