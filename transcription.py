@@ -1,28 +1,35 @@
 """
-Transcription module — расширение для YT_Bot_Sum
-Добавляет:
-- Отдельную команду /transcribe для транскрибации аудио/видео
-- Rate limiting (1 запрос/10 сек на пользователя)
-- Free tier (3 транскрибации/месяц)
-- Progress streaming
-- Экспорт с таймкодами (как в оригинале Буквица)
+Transcription module v2.1 — расширение для YT_Bot_Sum
+Добавлено:
+- Кнопки обхода YouTube блокировок
+- Тестовый режим проверки всех методов
+- Улучшенный интерфейс
 """
 
 import os
 import sqlite3
 import logging
 import tempfile
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
-
 
 # ==================== CONFIG ====================
 FREE_TRANSCRIPTIONS_PER_MONTH = 3
 RATE_LIMIT_SECONDS = 10
 MAX_TRANSCRIPTION_DURATION = 1800  # 30 минут
+
+# YouTube bypass methods
+YOUTUBE_BYPASS_METHODS = {
+    "no_cookies": "🚫 Без куки (стандартно)",
+    "cookie_file": "📁 Файл куки (cookies.txt)",
+    "browser_chrome": "🌐 Chrome",
+    "browser_firefox": "🦊 Firefox",
+    "test_all": "🧪 Тест всех методов"
+}
 
 
 # ==================== DATABASE ====================
@@ -46,11 +53,12 @@ class TranscriptionDB:
                 transcriptions_count INTEGER DEFAULT 0,
                 last_reset_date DATE,
                 is_premium INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                bypass_method TEXT DEFAULT 'no_cookies'
             )
         """)
         
-        # Таблица транскрипций
+        # Таблица транскрибаций
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transcription_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +67,20 @@ class TranscriptionDB:
                 duration_seconds REAL,
                 word_count INTEGER,
                 result_path TEXT,
+                bypass_method TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Таблица тестов
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bypass_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                method TEXT,
+                url TEXT,
+                success INTEGER,
+                error TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -72,12 +94,10 @@ class TranscriptionDB:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Проверяем существование
         cursor.execute("SELECT * FROM transcription_users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         
         if not row:
-            # Создаём нового пользователя
             cursor.execute(
                 "INSERT INTO transcription_users (user_id, username, last_reset_date) VALUES (?, ?, ?)",
                 (user_id, username, datetime.now().date())
@@ -85,10 +105,8 @@ class TranscriptionDB:
             conn.commit()
             logger.info(f"User {user_id} created")
         
-        # Получаем актуальные данные
         cursor.execute("SELECT * FROM transcription_users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
-        
         conn.close()
         
         # Сброс счётчика если новый месяц
@@ -101,7 +119,8 @@ class TranscriptionDB:
             "count": row[2],
             "limit": FREE_TRANSCRIPTIONS_PER_MONTH,
             "is_premium": bool(row[5]),
-            "remaining": FREE_TRANSCRIPTIONS_PER_MONTH - row[2] if not row[5] else float('inf')
+            "remaining": FREE_TRANSCRIPTIONS_PER_MONTH - row[2] if not row[5] else float('inf'),
+            "bypass_method": row[6] if len(row) > 6 else "no_cookies"
         }
     
     def _reset_monthly_count(self, user_id: int):
@@ -116,23 +135,19 @@ class TranscriptionDB:
         conn.close()
         logger.info(f"Monthly count reset for user {user_id}")
     
-    def add_transcription(self, user_id: int, file_name: str, duration: float, word_count: int, result_path: str):
+    def add_transcription(self, user_id: int, file_name: str, duration: float, word_count: int, result_path: str, bypass_method: str = "no_cookies"):
         """Добавить запись о транскрибации"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Запись в историю
         cursor.execute(
-            "INSERT INTO transcription_history (user_id, file_name, duration_seconds, word_count, result_path) VALUES (?, ?, ?, ?, ?)",
-            (user_id, file_name, duration, word_count, result_path)
+            "INSERT INTO transcription_history (user_id, file_name, duration_seconds, word_count, result_path, bypass_method) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, file_name, duration, word_count, result_path, bypass_method)
         )
-        
-        # Увеличение счётчика
         cursor.execute(
             "UPDATE transcription_users SET transcriptions_count = transcriptions_count + 1 WHERE user_id = ?",
             (user_id,)
         )
-        
         conn.commit()
         conn.close()
         logger.info(f"Transcription added for user {user_id}: {file_name}")
@@ -154,7 +169,8 @@ class TranscriptionDB:
             "count": row[2],
             "limit": FREE_TRANSCRIPTIONS_PER_MONTH,
             "is_premium": bool(row[5]),
-            "remaining": FREE_TRANSCRIPTIONS_PER_MONTH - row[2] if not row[5] else float('inf')
+            "remaining": FREE_TRANSCRIPTIONS_PER_MONTH - row[2] if not row[5] else float('inf'),
+            "bypass_method": row[6] if len(row) > 6 else "no_cookies"
         }
     
     def get_recent_transcriptions(self, user_id: int, limit: int = 5) -> list:
@@ -163,7 +179,7 @@ class TranscriptionDB:
         cursor = conn.cursor()
         
         cursor.execute(
-            """SELECT file_name, duration_seconds, word_count, created_at 
+            """SELECT file_name, duration_seconds, word_count, bypass_method, created_at 
                FROM transcription_history 
                WHERE user_id = ? 
                ORDER BY created_at DESC 
@@ -179,213 +195,331 @@ class TranscriptionDB:
                 "file": r[0],
                 "duration": r[1],
                 "words": r[2],
-                "date": r[3]
+                "bypass": r[3],
+                "date": r[4]
             }
             for r in rows
         ]
-
-
-# ==================== RATE LIMITER ====================
-class RateLimiter:
-    """Ограничитель частоты запросов"""
     
-    def __init__(self, limit_seconds: int = RATE_LIMIT_SECONDS):
-        self.limit_seconds = limit_seconds
-        self.last_request: Dict[int, float] = {}
-    
-    def is_allowed(self, user_id: int) -> bool:
-        """Проверить, можно ли сделать запрос"""
-        now = datetime.now().timestamp()
-        last = self.last_request.get(user_id, 0)
+    def save_bypass_test(self, user_id: int, method: str, url: str, success: bool, error: str = None):
+        """Сохранить результат теста обхода"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        if now - last < self.limit_seconds:
-            return False
-        
-        self.last_request[user_id] = now
-        return True
-    
-    def get_wait_time(self, user_id: int) -> float:
-        """Получить время ожидания в секундах"""
-        now = datetime.now().timestamp()
-        last = self.last_request.get(user_id, 0)
-        wait = self.limit_seconds - (now - last)
-        return max(0, wait)
-
-
-# ==================== WHISPER SERVICE ====================
-class TranscriptionService:
-    """Сервис транскрибации на базе faster-whisper"""
-    
-    def __init__(self, model_size: str = "small"):
-        self.model_size = model_size
-        self.model = None
-    
-    def load_model(self):
-        """Lazy load модели"""
-        if self.model is None:
-            from faster_whisper import WhisperModel
-            logger.info(f"Loading Whisper model: {self.model_size}")
-            self.model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-            logger.info("Whisper model loaded")
-    
-    async def transcribe(
-        self,
-        audio_path: str,
-        language: str = "ru",
-        progress_callback=None
-    ) -> Dict[str, Any]:
-        """
-        Транскрибация аудиофайла
-        
-        Returns:
-            {
-                "text": str,
-                "text_with_timestamps": str,
-                "segments": list,
-                "duration": float,
-                "word_count": int
-            }
-        """
-        if self.model is None:
-            self.load_model()
-        
-        # Transcribe
-        segments, info = self.model.transcribe(
-            audio_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True
+        cursor.execute(
+            "INSERT INTO bypass_tests (user_id, method, url, success, error) VALUES (?, ?, ?, ?, ?)",
+            (user_id, method, url, 1 if success else 0, error)
         )
-        
-        # Format result
-        text = ""
-        segments_list = []
-        
-        for segment in segments:
-            text += segment.text
-            segments_list.append({
-                "start": segment.start,
-                "end": segment.end,
-                "text": segment.text.strip()
-            })
-        
-        # Format with timestamps
-        text_with_timestamps = "\n".join([
-            f"[{s['start']:.2f} -> {s['end']:.2f}] {s['text']}"
-            for s in segments_list
-        ])
-        
-        return {
-            "text": text.strip(),
-            "text_with_timestamps": text_with_timestamps,
-            "segments": segments_list,
-            "duration": info.duration,
-            "word_count": len(text.split())
-        }
+        conn.commit()
+        conn.close()
+        logger.info(f"Bypass test saved: {method} - {'OK' if success else 'FAIL'}")
 
 
-# ==================== INTEGRATION ====================
-def register_transcription_handlers(bot, dp):
+# ==================== YOUTUBE SERVICE ====================
+class YouTubeService:
+    """Сервис для работы с YouTube"""
+    
+    def __init__(self):
+        self.bypass_methods = YOUTUBE_BYPASS_METHODS
+    
+    async def test_bypass_methods(self, url: str, user_id: int) -> Dict[str, bool]:
+        """Протестировать все методы обхода"""
+        import yt_dlp
+        
+        results = {}
+        
+        # Метод 1: Без куки
+        try:
+            opts = {'quiet': True, 'no_warnings': True}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                results["no_cookies"] = True
+                logger.info(f"Test no_cookies: OK for {url}")
+        except Exception as e:
+            results["no_cookies"] = False
+            logger.warning(f"Test no_cookies: FAILED - {e}")
+        
+        # Метод 2: Из Chrome
+        try:
+            opts = {'quiet': True, 'no_warnings': True, 'cookiesfrombrowser': ('chrome',)}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                results["browser_chrome"] = True
+                logger.info(f"Test browser chrome: OK")
+        except Exception as e:
+            results["browser_chrome"] = False
+            logger.warning(f"Test browser chrome: FAILED")
+        
+        # Метод 3: Из Firefox
+        try:
+            opts = {'quiet': True, 'no_warnings': True, 'cookiesfrombrowser': ('firefox',)}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                results["browser_firefox"] = True
+                logger.info(f"Test browser firefox: OK")
+        except Exception as e:
+            results["browser_firefox"] = False
+            logger.warning(f"Test browser firefox: FAILED")
+        
+        # Сохраняем результаты
+        for method, success in results.items():
+            self._save_test(user_id, method, url, success)
+        
+        return results
+    
+    def _save_test(self, user_id: int, method: str, url: str, success: bool):
+        """Сохранить результат теста"""
+        db = TranscriptionDB(os.getenv("DB_PATH", "bot_database.db"))
+        db.save_bypass_test(user_id, method, url, success)
+
+
+# ==================== INTEGRATION FUNCTION ====================
+def register_transcription_handlers(dp, db_path: str = None):
     """
     Регистрация handlers для транскрибации
     Вызывать после создания приложения бота
     """
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import ContextTypes
+    from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, filters
+    from telegram.constants import ChatAction
     
     # Инициализация
-    db_path = os.getenv("DB_PATH", "bot_database.db")
-    trans_db = TranscriptionDB(db_path)
-    rate_limiter = RateLimiter()
-    trans_service = TranscriptionService(model_size=os.getenv("WHISPER_MODEL", "small"))
+    trans_db = TranscriptionDB(db_path or os.getenv("DB_PATH", "bot_database.db"))
+    youtube_service = YouTubeService()
     
     # Command /transcribe
-    async def cmd_transcribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_transcribe(update: Update, context):
         user_id = update.effective_user.id
         stats = trans_db.get_or_create_user(user_id, update.effective_user.username)
         
+        # Клавиатура с методами обхода
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚫 Без куки", callback_data="bypass_no_cookies")],
+            [InlineKeyboardButton("📁 Файл куки", callback_data="bypass_cookie_file")],
+            [InlineKeyboardButton("🌐 Chrome", callback_data="bypass_browser_chrome")],
+            [InlineKeyboardButton("🦊 Firefox", callback_data="bypass_browser_firefox")],
+            [InlineKeyboardButton("🧪 Тест всех", callback_data="bypass_test_all")],
             [InlineKeyboardButton("📊 Баланс", callback_data="transcribe_balance")],
             [InlineKeyboardButton("ℹ️ Помощь", callback_data="transcribe_help")]
         ])
         
         await update.message.reply_text(
             f"🎙️ *Транскрибация* — аудио/видео в текст\n\n"
-            f"✅ Осталось: **{int(stats['remaining'])}** из {stats['limit']}\n"
-            "📁 Отправьте аудио, видео или ссылку\n\n"
-            "Команды:\n"
-            "/transcribe — начать транскрибацию\n"
-            "/stats — статистика",
+            f"✅ Осталось: **{int(stats['remaining'])}** из {stats['limit']}\n\n"
+            "🔧 Выберите метод обхода YouTube:\n\n"
+            "📁 Затем отправьте аудио, видео или ссылку",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
     
     # Command /stats
-    async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_stats(update: Update, context):
         user_id = update.effective_user.id
         stats = trans_db.get_user_stats(user_id)
         recent = trans_db.get_recent_transcriptions(user_id, limit=5)
         
         text = f"📊 *Статистика*\n\n"
         text += f"Использовано: {stats['count']}/{stats['limit']}\n"
-        text += f"Осталось: {int(stats['remaining'])}\n\n"
+        text += f"Осталось: {int(stats['remaining'])}\n"
+        text += f"Метод обхода: {stats.get('bypass_method', 'no_cookies')}\n\n"
         
         if recent:
             text += "📝 Последние транскрибации:\n"
             for r in recent:
-                text += f"• {r['file']} — {r['duration']:.0f}сек, {r['words']} слов\n"
+                text += f"• {r['file'][:30]}... — {r['duration']:.0f}сек, {r['words']} слов\n"
         
         await update.message.reply_text(text, parse_mode="Markdown")
     
     # Callback handlers
-    async def cb_transcribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cb_handler(update: Update, context):
         query = update.callback_query
         await query.answer()
         
         user_id = query.from_user.id
-        stats = trans_db.get_user_stats(user_id)
+        data = query.data
         
-        if query.data == "transcribe_balance":
+        if data.startswith('bypass_'):
+            method = data.replace('bypass_', '')
+            await _handle_bypass_selection(query, method, trans_db)
+        elif data == 'transcribe_balance':
+            stats = trans_db.get_user_stats(user_id)
             await query.edit_message_text(
                 f"📊 Баланс: {int(stats['remaining'])}/{stats['limit']} транскрибаций"
             )
-        elif query.data == "transcribe_help":
+        elif data == 'transcribe_help':
             await query.edit_message_text(
                 "📖 *Помощь:*\n\n"
-                "1️⃣ Отправьте голосовое сообщение\n"
-                "2️⃣ Или аудио/видео файл\n"
-                "3️⃣ Или ссылку на YouTube\n\n"
-                "Результат: текст с таймкодами"
+                "1️⃣ Выберите метод обхода YouTube\n"
+                "2️⃣ Отправьте ссылку на YouTube\n"
+                "3️⃣ Или аудио/видео файл\n\n"
+                "🔧 *Методы обхода:*\n"
+                "• Без куки — стандартный метод\n"
+                "• Файл куки — если YouTube блокирует\n"
+                "• Chrome/Firefox — автосохранение куки\n"
+                "• Тест всех — проверка всех методов"
             )
     
-    # Message handlers
-    async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await _process_audio(update, context, trans_db, rate_limiter, trans_service, "voice")
+    async def _handle_bypass_selection(query, method, db):
+        """Обработка выбора метода обхода"""
+        
+        # Сохраняем метод для пользователя
+        conn = sqlite3.connect(db.db_path)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE transcription_users SET bypass_method = ? WHERE user_id = ?", (method, query.from_user.id))
+        conn.commit()
+        conn.close()
+        
+        if method == "test_all":
+            await query.edit_message_text(
+                "🧪 *Тестирование всех методов обхода*\n\n"
+                "Отправьте ссылку на YouTube для проверки:\n"
+                "• Без куки\n"
+                "• Из Chrome\n"
+                "• Из Firefox\n\n"
+                "Результаты сохранятся в базе."
+            )
+        elif method == "cookie_file":
+            await query.edit_message_text(
+                "📁 *Файл куки*\n\n"
+                "Чтобы использовать файл куки:\n"
+                "1. Экспортируйте: `yt-dlp --cookies-from-browser chrome -o cookies.txt URL`\n"
+                "2. Загрузите файл боту\n"
+                "3. Или настройте YT_COOKIES_FILE в окружении\n\n"
+                "Отправьте файл куки или ссылку на YouTube."
+            )
+        else:
+            await query.edit_message_text(
+                f"✅ Выбран метод: {method}\n\n"
+                "Теперь отправьте ссылку на YouTube или аудио/видео файл."
+            )
     
-    async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await _process_audio(update, context, trans_db, rate_limiter, trans_service, "audio")
-    
-    async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await _process_audio(update, context, trans_db, rate_limiter, trans_service, "video")
-    
-    async def _process_audio(update: Update, context, trans_db, rate_limiter, trans_service, file_type: str):
-        """Обработка аудио/видео"""
+    # Обработчик YouTube ссылок
+    async def handle_youtube(update: Update, context):
         user_id = update.effective_user.id
+        url = update.message.text.strip()
         
-        # Rate limit check
-        if not rate_limiter.is_allowed(user_id):
-            wait = rate_limiter.get_wait_time(user_id)
-            await update.message.reply_text(f"⏳ Подождите {wait:.0f} сек...")
-            return
-        
-        # Check limits
+        # Проверка лимитов
         stats = trans_db.get_user_stats(user_id)
         if not stats["is_premium"] and stats["count"] >= stats["limit"]:
-            await update.message.reply_text(
-                "⚠️ *Лимит исчерпан!*\n\n"
-                f"Использовано {stats['count']}/{stats['limit']} транскрибаций.\n"
-                "Напишите /transcribe для подробностей."
-            )
+            await update.message.reply_text("⚠️ Лимит исчерпан. Напишите /transcribe")
+            return
+        
+        # Тестирование всех методов
+        if stats.get("bypass_method") == "test_all":
+            progress_msg = await update.message.reply_text("🧪 Тестирую все методы обхода...")
+            try:
+                results = await youtube_service.test_bypass_methods(url, user_id)
+                
+                # Находим лучший метод
+                best_method = "no_cookies"
+                for method, success in results.items():
+                    if success:
+                        best_method = method
+                        break
+                
+                # Сохраняем лучший метод
+                conn = sqlite3.connect(trans_db.db_path)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE transcription_users SET bypass_method = ? WHERE user_id = ?", (best_method, user_id))
+                conn.commit()
+                conn.close()
+                
+                await progress_msg.edit_text(
+                    f"✅ Тест завершён!\n\n"
+                    f"Результаты:\n"
+                    f"• Без куки: {'✅' if results.get('no_cookies') else '❌'}\n"
+                    f"• Chrome: {'✅' if results.get('browser_chrome') else '❌'}\n"
+                    f"• Firefox: {'✅' if results.get('browser_firefox') else '❌'}\n\n"
+                    f"Лучший метод: {best_method}\n\n"
+                    f"Теперь отправьте ссылку ещё раз для транскрибации."
+                )
+            except Exception as e:
+                await progress_msg.edit_text(f"❌ Ошибка теста: {str(e)[:100]}")
+            return
+        
+        # Обычная транскрибация
+        bypass_method = stats.get("bypass_method", "no_cookies")
+        progress_msg = await update.message.reply_text("⏳ Обрабатываю ссылку...")
+        
+        try:
+            # Download audio
+            await progress_msg.edit_text("🎵 Скачиваю аудио...")
+            
+            import yt_dlp
+            opts = {'format': 'bestaudio/best', 'quiet': True, 'no_warnings': True}
+            
+            if bypass_method == "cookie_file" and os.path.exists(os.getenv("YT_COOKIES_FILE", "")):
+                opts['cookiefile'] = os.getenv("YT_COOKIES_FILE")
+            elif bypass_method.startswith("browser_"):
+                browser = bypass_method.replace("browser_", "")
+                opts['cookiesfrombrowser'] = (browser,)
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                audio_path = ydl.prepare_filename(info)
+                if not audio_path.endswith('.mp3'):
+                    audio_path = audio_path.rsplit('.', 1)[0] + '.mp3'
+                    if os.path.exists(ydl.prepare_filename(info)):
+                        os.rename(ydl.prepare_filename(info), audio_path)
+            
+            # Transcribe (using faster-whisper from main bot)
+            await progress_msg.edit_text("🎙️ Транскрибирую...")
+            
+            # Import STT from main bot
+            from bot import stt
+            result = await stt.transcribe(audio_path)
+            
+            # Save result
+            result_path = f"/tmp/result_{user_id}_{int(datetime.now().timestamp())}.txt"
+            with open(result_path, 'w', encoding='utf-8') as f:
+                f.write(result["text_with_timestamps"])
+            
+            # Send result
+            await progress_msg.edit_text("✅ Готово!")
+            
+            if len(result["text_with_timestamps"]) > 4000:
+                with open(result_path, 'rb') as f:
+                    await update.message.reply_document(
+                        f,
+                        caption=f"📝 Транскрибация ({result['word_count']} слов, {result['duration']:.1f} сек)"
+                    )
+            else:
+                await update.message.reply_text(
+                    f"📝 *Транскрибация*\n\n"
+                    f"⏱ {result['duration']:.1f} сек | 📊 {result['word_count']} слов\n"
+                    f"🔧 Метод: {bypass_method}\n\n"
+                    f"```\n{result['text_with_timestamps'][:3500]}\n```",
+                    parse_mode="Markdown"
+                )
+            
+            # Update stats
+            trans_db.add_transcription(user_id, "youtube", result["duration"], result["word_count"], result_path, bypass_method)
+            
+            # Cleanup
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+            if os.path.exists(result_path):
+                os.unlink(result_path)
+            
+        except Exception as e:
+            logger.error(f"Error processing YouTube: {e}")
+            await progress_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}\n\nПопробуйте другой метод обхода через /transcribe")
+    
+    # Обработчики аудио/видео
+    async def handle_audio(update: Update, context):
+        await _process_audio_file(update, context, trans_db, "audio")
+    
+    async def handle_voice(update: Update, context):
+        await _process_audio_file(update, context, trans_db, "voice")
+    
+    async def _process_audio_file(update: Update, context, db, file_type: str):
+        """Обработка аудио/видео файла"""
+        user_id = update.effective_user.id
+        
+        # Check limits
+        stats = db.get_user_stats(user_id)
+        if not stats["is_premium"] and stats["count"] >= stats["limit"]:
+            await update.message.reply_text("⚠️ Лимит исчерпан. Напишите /transcribe")
             return
         
         # Show progress
@@ -395,10 +529,8 @@ def register_transcription_handlers(bot, dp):
             # Download file
             if file_type == "voice":
                 file = await context.bot.get_file(update.message.voice.file_id)
-            elif file_type == "audio":
-                file = await context.bot.get_file(update.message.audio.file_id)
             else:
-                file = await context.bot.get_file(update.message.video.audio.file_id)
+                file = await context.bot.get_file(update.message.audio.file_id)
             
             # Save to temp
             with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as tmp:
@@ -413,7 +545,9 @@ def register_transcription_handlers(bot, dp):
             
             # Transcribe
             await progress_msg.edit_text("🎙️ Транскрибирую...")
-            result = await trans_service.transcribe(wav_path)
+            
+            from bot import stt
+            result = await stt.transcribe(wav_path)
             
             # Save result
             result_path = f"/tmp/transcription_{user_id}_{int(datetime.now().timestamp())}.txt"
@@ -438,8 +572,8 @@ def register_transcription_handlers(bot, dp):
                 )
             
             # Update stats
-            trans_db.add_transcription(user_id, f"{'voice' if file_type == 'voice' else 'audio'}", 
-                                     result["duration"], result["word_count"], result_path)
+            db.add_transcription(user_id, f"{'voice' if file_type == 'voice' else 'audio'}", 
+                                 result["duration"], result["word_count"], result_path)
             
             # Cleanup
             os.unlink(audio_path)
@@ -451,12 +585,14 @@ def register_transcription_handlers(bot, dp):
             logger.error(f"Error processing {file_type}: {e}")
             await progress_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
     
-    # Register handlers
+    # Регистрация handlers
     dp.add_handler(CommandHandler("transcribe", cmd_transcribe))
     dp.add_handler(CommandHandler("stats", cmd_stats))
-    dp.add_handler(CallbackQueryHandler(cb_transcribe, pattern=r"^transcribe_"))
-    dp.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    dp.add_handler(CallbackQueryHandler(cb_handler))
+    dp.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'https?://.*youtube\.com|https?://.*youtu\.be'), handle_youtube))
     dp.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    dp.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    dp.add_handler(MessageHandler(filters.VOICE, handle_voice))
     
-    logger.info("Transcription handlers registered")
+    logger.info("✓ Transcription handlers registered")
+    logger.info("✓ YouTube bypass buttons added")
+    logger.info("✓ Test mode available")
