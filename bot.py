@@ -93,6 +93,9 @@ class BotDatabase:
 
     def __init__(self, db_path: str):
         self.db_path = db_path
+        _parent = os.path.dirname(os.path.abspath(db_path))
+        if _parent:
+            os.makedirs(_parent, exist_ok=True)
         self._init_db()
 
     def _conn(self):
