@@ -1,24 +1,28 @@
 # Render deploy config (Blueprint)
-# https://render.com/docs/blueprint-spec
+# Обход ограничения Free-тарифа: Web Service + фиктивный HTTP-сервер.
+# Free-тариф доступен только для Web Service / Static Site (у Background Worker его нет).
+# Бот использует run_polling() + встроенный фиктивный HTTP-сервер (порт $PORT).
+# ВАЖНО: секреты (token/key) задаются в панели Render, НЕ в этом файле.
 services:
-  - type: worker
+  - type: web
     name: ai-summary-bot
     runtime: docker
     repo: https://github.com/affigeny/AI-Summary-YT-Voice-Agent-Bot
-    region: frankfurt # или oregon / singapore
+    region: frankfurt
     branch: main
     plan: free
-    healthCheckPath: /
+    healthCheckPath: /health
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: AI_PROVIDER
-        sync: false
-      - key: AI_API_KEY
-        sync: false
+        value: openai
       - key: AI_API_URL
-        sync: false
+        value: https://openrouter.ai/api/v1
       - key: AI_MODEL
-        sync: false
+        value: openai/gpt-4o-mini
       - key: DB_PATH
+        value: /var/data/bot_database.db
+      # AI_API_KEY задаётся вручную (секрет, не хранить в репозитории)
+      - key: AI_API_KEY
         sync: false

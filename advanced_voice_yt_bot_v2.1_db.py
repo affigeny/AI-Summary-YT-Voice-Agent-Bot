@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import asyncio
+import threading
 import sqlite3
 import json
 from io import BytesIO
@@ -33,6 +34,7 @@ AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_API_URL = os.getenv("AI_API_URL", "https://api.openai.com/v1")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini")
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
+PORT = int(os.getenv("PORT", "10000"))
 
 # Дефолтные шаблоны переработки
 DEFAULT_TEMPLATES = {
@@ -54,6 +56,7 @@ DEFAULT_TEMPLATES = {
     }
 }
 
+
 class AdvancedMediaYTAgentBotV2DB:
     def __init__(self):
         self.recognizer = sr.Recognizer()
@@ -64,7 +67,7 @@ class AdvancedMediaYTAgentBotV2DB:
         """Инициализация базы данных SQLite для постоянного хранения шаблонов и кэша."""
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
+
         # Таблица кастомных шаблонов пользователей
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS templates (
@@ -75,7 +78,7 @@ class AdvancedMediaYTAgentBotV2DB:
                 PRIMARY KEY (user_id, template_id)
             )
         ''')
-        
+
         # Таблица кэша транскриптов YouTube для экономии лимитов
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS youtube_cache (
@@ -84,7 +87,7 @@ class AdvancedMediaYTAgentBotV2DB:
                 cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+
         # Таблица истории диалогов для сохранения контекста при перезапуске
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS chat_history (
@@ -94,7 +97,7 @@ class AdvancedMediaYTAgentBotV2DB:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
+
         conn.commit()
         conn.close()
 
@@ -152,7 +155,7 @@ class AdvancedMediaYTAgentBotV2DB:
             logger.error(f"Ошибка записи в кэш YT: {e}")
 
     def extract_youtube_id(self, url: str) -> str:
-        pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/(?:[^/\n\\s]+/\\S+/|(?:v|e(?:mbed)?)/|shorts/|\\S*?[?&]v=)|youtu\.be/)([a-zA-Z0-9_-]{11})'
+        pattern = r'(?:https?://)?(?:www\.)?(?:youtube\.com/(?:[^/\n\s]+/\S+/|(?:v|e(?:mbed)?)/|shorts/|\S*?[?&]v=)|youtu\.be/)([a-zA-Z0-9_-]{11})'
         match = re.search(pattern, url)
         return match.group(1) if match else None
 
@@ -182,7 +185,7 @@ class AdvancedMediaYTAgentBotV2DB:
 
             data = await loop.run_in_executor(None, transcript.fetch)
             full_text = " ".join([entry['text'] for entry in data])
-            
+
             # Сохраняем в кэш для будущих запросов
             self.save_youtube_cache(video_id, full_text)
             return full_text
@@ -199,12 +202,12 @@ class AdvancedMediaYTAgentBotV2DB:
             wav_io = BytesIO()
             await loop.run_in_executor(None, lambda: audio.export(wav_io, format="wav"))
             wav_io.seek(0)
-            
+
             def record_and_recognize():
                 with sr.AudioFile(wav_io) as source:
                     audio_data = self.recognizer.record(source)
                     return self.recognizer.recognize_google(audio_data, language="ru-RU")
-            
+
             text = await loop.run_in_executor(None, record_and_recognize)
             return text
         except sr.UnknownValueError:
@@ -229,9 +232,8 @@ class AdvancedMediaYTAgentBotV2DB:
         ]
 
         if context_text:
-            messages.append({"role": "user", "content": f"Вот исходный текст/транскрипт для контекста:
-{context_text}"})
-        
+            messages.append({"role": "user", "content": f"Вот исходный текст/транскрипт для контекста:\n\n{context_text}"})
+
         if chat_history:
             messages.extend(chat_history)
         else:
@@ -262,24 +264,14 @@ class AdvancedMediaYTAgentBotV2DB:
     # --- Обработчики Telegram ---
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_text = (
-            "🚀 **v2.0.0 (Версия с Базой Данных и Управлением Шаблонами)**
-
-"
-            "В новой версии добавлены:
-"
-            "🗄 **SQLite База Данных**: Сессии, кэш субтитров и шаблоны сохраняются вечно.
-"
-            "💾 **Кэширование YouTube**: Повторный запрос видео выполняется мгновенно и без лимитов.
-"
-            "🛠 **Кастомные шаблоны**: Вы можете создавать и изменять свои шаблоны переработки!
-
-"
-            "**Команды для управления шаблонами:**
-"
-            "📝 `/add_template ID | Название | Промпт` — Добавить или обновить ваш шаблон.
-"
-            "Например:
-"
+            "🚀 **v2.0.0 (Версия с Базой Данных и Управлением Шаблонами)**\n\n"
+            "В новой версии добавлены:\n"
+            "🗄 **SQLite База Данных**: Сессии, кэш субтитров и шаблоны сохраняются вечно.\n"
+            "💾 **Кэширование YouTube**: Повторный запрос видео выполняется мгновенно и без лимитов.\n"
+            "🛠 **Кастомные шаблоны**: Вы можете создавать и изменять свои шаблоны переработки!\n\n"
+            "**Команды для управления шаблонами:**\n"
+            "📝 `/add_template ID | Название | Промпт` — Добавить или обновить ваш шаблон.\n"
+            "Например:\n"
             "`/add_template 5 | Мой переводчик | Переведи текст на английский язык.`"
         )
         await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -290,19 +282,18 @@ class AdvancedMediaYTAgentBotV2DB:
         text = " ".join(context.args)
         if not text or "|" not in text:
             await update.message.reply_text(
-                "⚠️ Неверный формат! Используйте:
-"
+                "⚠️ Неверный формат! Используйте:\n"
                 "`/add_template ID | Название | Промпт`"
             )
             return
-            
+
         try:
             parts = [p.strip() for p in text.split("|")]
             if len(parts) < 3:
                 raise ValueError("Не все поля заполнены.")
-                
+
             template_id, name, prompt = parts[0], parts[1], parts[2]
-            
+
             # Сохраняем в базу данных SQLite
             self.save_custom_template(user_id, template_id, name, prompt)
             await update.message.reply_text(f"✅ Шаблон *'{name}'* (ID: {template_id}) успешно сохранен и доступен в меню!", parse_mode="Markdown")
@@ -316,7 +307,7 @@ class AdvancedMediaYTAgentBotV2DB:
         if video_id:
             status = await update.message.reply_text("📥 Получаю транскрипт видео (проверяю кэш)...")
             transcript = await self.fetch_youtube_transcript_async(video_id)
-            
+
             if transcript.startswith("Error"):
                 await status.edit_text(f"❌ Не удалось получить субтитры: {transcript}")
             else:
@@ -333,20 +324,20 @@ class AdvancedMediaYTAgentBotV2DB:
                 status = await update.message.reply_text("🤖 Думаю над ответом...")
                 session = self.user_sessions[user_id]
                 session["chat_history"].append({"role": "user", "content": text})
-                
+
                 ai_response = await self.call_llm_api_async("", session["text"], session["chat_history"])
                 session["chat_history"].append({"role": "assistant", "content": ai_response})
-                
+
                 await status.edit_text(ai_response)
             else:
                 await update.message.reply_text("Отправьте аудиофайл, голосовое или ссылку на YouTube/Shorts.")
 
     async def handle_audio_or_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = await update.message.reply_text("📥 Обрабатываю аудиопоток...")
-        
+
         is_voice = update.message.voice is not None
         file_obj = update.message.voice if is_voice else update.message.audio
-        
+
         if is_voice:
             original_format = "ogg"
         else:
@@ -362,10 +353,10 @@ class AdvancedMediaYTAgentBotV2DB:
 
         tg_file = await context.bot.get_file(file_obj.file_id)
         file_bytes = await tg_file.download_as_bytearray()
-        
+
         await status.edit_text("🎙 Распознаю речь...")
         transcribed_text = await self.transcribe_audio_bytes_async(bytes(file_bytes), original_format)
-        
+
         if transcribed_text.startswith("["):
             await status.edit_text(f"❌ Ошибка распознавания: {transcribed_text}")
         else:
@@ -374,18 +365,17 @@ class AdvancedMediaYTAgentBotV2DB:
                 "text": transcribed_text,
                 "chat_history": []
             }
-            await status.edit_text(f"🗣 **Распознанный текст:**
-"{transcribed_text[:200]}..."")
+            await status.edit_text(f"🗣 **Распознанный текст:**\n{transcribed_text[:200]}...")
             await self.show_template_keyboard(update, context)
 
     async def show_template_keyboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         templates = self.get_user_templates(user_id)
-        
+
         keyboard = []
         for tid, temp in templates.items():
             keyboard.append([InlineKeyboardButton(temp["name"], callback_data=f"template_{tid}")])
-        
+
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
             "⚙️ **Выберите шаблон переработки информации:**",
@@ -395,7 +385,7 @@ class AdvancedMediaYTAgentBotV2DB:
     async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-        
+
         user_id = update.effective_user.id
         if user_id not in self.user_sessions:
             await query.edit_message_text("⚠️ Ошибка: Сессия не найдена.")
@@ -406,37 +396,62 @@ class AdvancedMediaYTAgentBotV2DB:
             template_id = data.split("_")[1]
             templates = self.get_user_templates(user_id)
             template = templates.get(template_id)
-            
+
             if template:
                 await query.edit_message_text(f"🤖 Применяю шаблон: *{template['name']}*...")
-                
+
                 context_text = self.user_sessions[user_id]["text"]
                 processed_result = await self.call_llm_api_async(template["prompt"], context_text)
-                
+
                 result_text = (
-                    f"✨ **Результат по шаблону '{template['name']}':**
-
-"
-                    f"{processed_result}
-
-"
+                    f"✨ **Результат по шаблону '{template['name']}':**\n\n"
+                    f"{processed_result}\n\n"
                     f"💬 *Вы можете продолжить общение с ИИ. Просто пишите вопросы текстом в чат!*"
                 )
-                
+
                 self.user_sessions[user_id]["chat_history"] = [
                     {"role": "assistant", "content": processed_result}
                 ]
-                
+
                 if len(result_text) > 4000:
                     for chunk in range(0, len(result_text), 4000):
                         await query.message.reply_text(result_text[chunk:chunk+4000])
                 else:
                     await query.message.reply_text(result_text)
 
+
+# ==== Фейковый веб-сервер для Render Web Service (обход ограничения Free-тарифа) ====
+def run_webserver():
+    """Простой HTTP-сервер без внешних зависимостей, отвечает 200 на / для Health Check."""
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass  # тишина в логах health-check'а
+
+    try:
+        server = HTTPServer(("0.0.0.0", PORT), Handler)
+        logger.info(f"Health-check сервер слушает порт {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Ошибка запуска веб-сервера: {e}")
+
+
 def main():
     if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("[!] Укажите реальный TELEGRAM_BOT_TOKEN!")
         return
+
+    # Веб-заглушку поднимаем в отдельном потоке, чтобы Render видел порт
+    threading.Thread(target=run_webserver, daemon=True).start()
 
     bot_agent = AdvancedMediaYTAgentBotV2DB()
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -449,6 +464,7 @@ def main():
 
     print("🚀 v2.0.0 Асинхронный ИИ-Бот с базой данных SQLite запущен...")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
