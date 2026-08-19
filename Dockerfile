@@ -22,3 +22,4 @@ COPY checkpoint_manager.py .
 
 # Запуск бота (polling + фиктивный health-check сервер на $PORT)
 CMD ["python", "bot.py"]
+
