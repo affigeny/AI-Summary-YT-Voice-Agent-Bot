@@ -1,16 +1,16 @@
 """
-Transcription module v2.1 — расширение для YT_Bot_Sum
+Transcription module v2.2 — расширение для YT_Bot_Sum
+Исправлена ошибка: добавлен RateLimiter класс
 Добавлено:
-- Кнопки обхода YouTube блокировок
+- 5 методов обхода YouTube блокировок
 - Тестовый режим проверки всех методов
-- Улучшенный интерфейс
+- Улучшенный интерфейс с кнопками
 """
 
 import os
 import sqlite3
 import logging
 import tempfile
-import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -30,6 +30,33 @@ YOUTUBE_BYPASS_METHODS = {
     "browser_firefox": "🦊 Firefox",
     "test_all": "🧪 Тест всех методов"
 }
+
+
+# ==================== RATE LIMITER ====================
+class RateLimiter:
+    """Ограничитель частоты запросов"""
+    
+    def __init__(self, limit_seconds: int = RATE_LIMIT_SECONDS):
+        self.limit_seconds = limit_seconds
+        self.last_request: Dict[int, float] = {}
+    
+    def is_allowed(self, user_id: int) -> bool:
+        """Проверить, можно ли сделать запрос"""
+        now = datetime.now().timestamp()
+        last = self.last_request.get(user_id, 0)
+        
+        if now - last < self.limit_seconds:
+            return False
+        
+        self.last_request[user_id] = now
+        return True
+    
+    def get_wait_time(self, user_id: int) -> float:
+        """Получить время ожидания в секундах"""
+        now = datetime.now().timestamp()
+        last = self.last_request.get(user_id, 0)
+        wait = self.limit_seconds - (now - last)
+        return max(0, wait)
 
 
 # ==================== DATABASE ====================
@@ -281,10 +308,10 @@ def register_transcription_handlers(dp, db_path: str = None):
     """
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, filters
-    from telegram.constants import ChatAction
     
     # Инициализация
     trans_db = TranscriptionDB(db_path or os.getenv("DB_PATH", "bot_database.db"))
+    rate_limiter = RateLimiter()
     youtube_service = YouTubeService()
     
     # Command /transcribe
@@ -398,6 +425,12 @@ def register_transcription_handlers(dp, db_path: str = None):
         user_id = update.effective_user.id
         url = update.message.text.strip()
         
+        # Rate limit check
+        if not rate_limiter.is_allowed(user_id):
+            wait = rate_limiter.get_wait_time(user_id)
+            await update.message.reply_text(f"⏳ Подождите {wait:.0f} сек...")
+            return
+        
         # Проверка лимитов
         stats = trans_db.get_user_stats(user_id)
         if not stats["is_premium"] and stats["count"] >= stats["limit"]:
@@ -507,14 +540,20 @@ def register_transcription_handlers(dp, db_path: str = None):
     
     # Обработчики аудио/видео
     async def handle_audio(update: Update, context):
-        await _process_audio_file(update, context, trans_db, "audio")
+        await _process_audio_file(update, context, trans_db, rate_limiter, "audio")
     
     async def handle_voice(update: Update, context):
-        await _process_audio_file(update, context, trans_db, "voice")
+        await _process_audio_file(update, context, trans_db, rate_limiter, "voice")
     
-    async def _process_audio_file(update: Update, context, db, file_type: str):
+    async def _process_audio_file(update: Update, context, db, rl, file_type: str):
         """Обработка аудио/видео файла"""
         user_id = update.effective_user.id
+        
+        # Rate limit check
+        if not rl.is_allowed(user_id):
+            wait = rl.get_wait_time(user_id)
+            await update.message.reply_text(f"⏳ Подождите {wait:.0f} сек...")
+            return
         
         # Check limits
         stats = db.get_user_stats(user_id)
