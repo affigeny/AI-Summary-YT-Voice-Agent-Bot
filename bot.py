@@ -34,7 +34,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
-__version__ = "4.1.3"
+__version__ = "4.1.4"
 VERSION_STRING = __version__  # Keep in sync
 
 import aiohttp
@@ -352,6 +352,9 @@ class YTClient:
                 "subtitleslangs": ["ru", "en"],
                 "subtitlesformat": "vtt",
                 "outtmpl": os.path.join(tmpdir, "%(title).80s.%(ext)s"),
+                # Таймауты, чтобы не зависать вечно при блокировке
+                "http_timeout": 15,
+                "socket_timeout": 10,
                 # Имитируем браузер, чтобы уменьшить шансы блокировки
                 "http_headers": {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -577,10 +580,19 @@ class MediaBot:
             "title": title,
         }
 
-    async def _run_sync(self, func, *args):
-        """Запуск синхронной функции в отдельном потоке."""
+    async def _run_sync(self, func, *args, timeout=30):
+        """Запуск синхронной функции в отдельном потоке с таймаутом."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, func, *args)
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, func, *args),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Задача {func.__name__} не завершена за {timeout}s — "
+                "YouTube медленный или заблокировал запрос."
+            )
 
     # -- Команды -----------------------------------------------------------
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,7 +644,7 @@ class MediaBot:
                 blocked = False
                 try:
                     transcript = await self._run_sync(
-                        self.yt.fetch_subtitles, video_id
+                        self.yt.fetch_subtitles, video_id, timeout=45
                     )
                 except YouTubeBlockingError as e:
                     # Субтитры заблокированы bot-check → пробуем аудио-fallback.
@@ -641,8 +653,13 @@ class MediaBot:
                         "пробую скачать аудио и распознать речь (Whisper)..."
                     )
                     try:
-                        transcript = await self._transcribe_youtube_audio(video_id)
+                        transcript = await self._run_sync(
+                            self._transcribe_youtube_audio, video_id, timeout=60
+                        )
                     except YouTubeBlockingError:
+                        blocked = True
+                    except TimeoutError:
+                        # Аудио тоже зависло — считаем блокировкой
                         blocked = True
                 if blocked:
                     await status.edit_text(
@@ -656,10 +673,15 @@ class MediaBot:
                     await status.edit_text(
                         "\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
                     )
-                    transcript = await self._transcribe_youtube_audio(video_id)
+                    try:
+                        transcript = await self._run_sync(
+                            self._transcribe_youtube_audio, video_id, timeout=60
+                        )
+                    except TimeoutError:
+                        transcript = None
                 if not transcript:
                     await status.edit_text(
-                        "\u274c Не удалось получить содержание видео."
+                        "\u274c Не удалось получить содержание видео (YouTube блокирует или нет субтитров)."
                     )
                     return
                 title = ""
@@ -701,20 +723,25 @@ class MediaBot:
             except Exception:
                 pass  # если даже не удалось отправить, просто логгируем
 
-    async def _transcribe_youtube_audio(self, video_id: str) -> str:
+    async def _transcribe_youtube_audio(self, video_id: str, timeout=60) -> str:
         """Скачивает аудио и распознаёт локально (fallback без субтитров).
 
-        Пробрасывает YouTubeBlockingError, если выкачка аудио тоже заблокирована.
+        Raises YouTubeBlockingError если выкачка аудио заблокирована.
+        Raises TimeoutError если операция заняла слишком много времени.
         """
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 path = await self._run_sync(
-                    self.yt.download, video_id, "bestaudio", tmp
+                    self.yt.download, video_id, "bestaudio", tmp, timeout=timeout
                 )
                 if not os.path.exists(path):
                     return ""
-                return await self._run_sync(self.stt.transcribe_file, path)
+                return await self._run_sync(
+                    self.stt.transcribe_file, path, timeout=timeout
+                )
         except YouTubeBlockingError:
+            raise
+        except TimeoutError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка распознавания аудио YT: %s", exc)
