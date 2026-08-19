@@ -653,13 +653,13 @@ class MediaBot:
                         "пробую скачать аудио и распознать речь (Whisper)..."
                     )
                     try:
-                        transcript = await self._run_sync(
-                            self._transcribe_youtube_audio, video_id, timeout=60
+                        transcript = await asyncio.wait_for(
+                            self._transcribe_youtube_audio(video_id),
+                            timeout=60
                         )
                     except YouTubeBlockingError:
                         blocked = True
-                    except TimeoutError:
-                        # Аудио тоже зависло — считаем блокировкой
+                    except asyncio.TimeoutError:
                         blocked = True
                 if blocked:
                     await status.edit_text(
@@ -674,10 +674,11 @@ class MediaBot:
                         "\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
                     )
                     try:
-                        transcript = await self._run_sync(
-                            self._transcribe_youtube_audio, video_id, timeout=60
+                        transcript = await asyncio.wait_for(
+                            self._transcribe_youtube_audio(video_id),
+                            timeout=60
                         )
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         transcript = None
                 if not transcript:
                     await status.edit_text(
