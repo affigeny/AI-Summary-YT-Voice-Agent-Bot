@@ -34,8 +34,8 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
-__version__ = "4.0.0"
-VERSION_STRING = "v4.0.0"
+__version__ = "4.1.1"
+VERSION_STRING = "v4.1.0"
 
 import aiohttp
 from pydub import AudioSegment
@@ -588,62 +588,71 @@ class MediaBot:
 
     # -- Приём текста / ссылки --------------------------------------------
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        text = (update.message.text or "").strip()
-        video_id = self.extract_youtube_id(text)
-        user_id = update.effective_user.id
+        try:
+            text = (update.message.text or "").strip()
+            video_id = self.extract_youtube_id(text)
+            user_id = update.effective_user.id
 
-        if video_id:
-            status = await update.message.reply_text(
-                "\\U0001F4E5 Извлекаю видео и субтитры..."
-            )
-            try:
-                transcript = await self._run_sync(
-                    self.yt.fetch_subtitles, video_id
+            if video_id:
+                status = await update.message.reply_text(
+                    "\\U0001F4E5 Извлекаю видео и субтитры..."
                 )
-            except YouTubeBlockingError as e:
-                await status.edit_text(f"\\u26a0\\ufe0f {e}")
-                return
-            if not transcript:
-                # Нет субтитров → пробуем скачать аудио и распознать локально.
+                try:
+                    transcript = await self._run_sync(
+                        self.yt.fetch_subtitles, video_id
+                    )
+                except YouTubeBlockingError as e:
+                    await status.edit_text(f"\\u26a0\\ufe0f {e}")
+                    return
+                if not transcript:
+                    # Нет субтитров → пробуем скачать аудио и распознать локально.
+                    await status.edit_text(
+                        "\\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
+                    )
+                    transcript = await self._transcribe_youtube_audio(video_id)
+                if not transcript:
+                    await status.edit_text(
+                        "\\u274c Не удалось получить содержание видео."
+                    )
+                    return
+                title = ""
+                try:
+                    info = await self._run_sync(self.yt.extract_info, video_id)
+                    title = info.get("title", "")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._set_session(
+                    user_id, transcript, source="youtube",
+                    video_id=video_id, title=title,
+                )
                 await status.edit_text(
-                    "\\U0001F3A7 Субтитров нет — распознаю речь локально (Whisper)..."
+                    f"\\u2705 Готово:\\n**{title}**\\n\\n{transcript[:400]}..."
                 )
-                transcript = await self._transcribe_youtube_audio(video_id)
-            if not transcript:
-                await status.edit_text(
-                    "\\u274c Не удалось получить содержание видео."
-                )
+                await self._send_action_keyboard(update, context)
                 return
-            title = ""
-            try:
-                info = await self._run_sync(self.yt.extract_info, video_id)
-                title = info.get("title", "")
-            except Exception:  # noqa: BLE001
-                pass
-            self._set_session(
-                user_id, transcript, source="youtube",
-                video_id=video_id, title=title,
-            )
-            await status.edit_text(
-                f"\\u2705 Готово:\\n**{title}**\\n\\n{transcript[:400]}..."
-            )
-            await self._send_action_keyboard(update, context)
-            return
 
-        # Обычный текст → продолжение диалога с ИИ.
-        session = self.user_sessions.get(user_id)
-        if session and session.get("text"):
-            status = await update.message.reply_text("\\U0001F916 Думаю...")
-            session["chat_history"].append({"role": "user", "content": text})
-            reply = await self.llm.complete(
-                "", session["text"], session["chat_history"]
-            )
-            session["chat_history"].append({"role": "assistant", "content": reply})
-            await status.edit_text(reply)
-        else:
-            await update.message.reply_text(
-                "Пришлите YouTube-ссылку, голосовое или аудиофайл."
-            )
+            # Обычный текст → продолжение диалога с ИИ.
+            session = self.user_sessions.get(user_id)
+            if session and session.get("text"):
+                status = await update.message.reply_text("\\U0001F916 Думаю...")
+                session["chat_history"].append({"role": "user", "content": text})
+                reply = await self.llm.complete(
+                    "", session["text"], session["chat_history"]
+                )
+                session["chat_history"].append({"role": "assistant", "content": reply})
+                await status.edit_text(reply)
+            else:
+                await update.message.reply_text(
+                    "Пришлите YouTube-ссылку, голосовое или аудиофайл."
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в handle_text")
+            try:
+                await update.message.reply_text(
+                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                )
+            except Exception:
+                pass  # если даже не удалось отправить, просто логгируем
 
     async def _transcribe_youtube_audio(self, video_id: str) -> str:
         """Скачивает аудио и распознаёт локально (fallback без субтитров)."""
@@ -663,25 +672,34 @@ class MediaBot:
     async def handle_audio_or_voice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
-        status = await update.message.reply_text("\\U0001F4E5 Обрабатываю аудио...")
-        is_voice = update.message.voice is not None
-        file_obj = update.message.voice if is_voice else update.message.audio
-        fmt = "ogg" if is_voice else self._fmt_from_filename(file_obj.file_name)
-        tg_file = await context.bot.get_file(file_obj.file_id)
-        raw = await tg_file.download_as_bytearray()
-        await status.edit_text("\\U0001F399 Распознаю речь (Whisper)...")
-        text = await self._run_sync(
-            self.stt.transcribe_bytes, bytes(raw), fmt
-        )
-        if not text:
-            await status.edit_text("\\u274c Не удалось распознать аудио.")
-            return
-        user_id = update.effective_user.id
-        self._set_session(user_id, text, source="audio")
-        await status.edit_text(
-            f"\\U0001F5E3 **Распознанный текст:**\\n{text[:300]}..."
-        )
-        await self._send_action_keyboard(update, context)
+        try:
+            status = await update.message.reply_text("\\U0001F4E5 Обрабатываю аудио...")
+            is_voice = update.message.voice is not None
+            file_obj = update.message.voice if is_voice else update.message.audio
+            fmt = "ogg" if is_voice else self._fmt_from_filename(file_obj.file_name)
+            tg_file = await context.bot.get_file(file_obj.file_id)
+            raw = await tg_file.download_as_bytearray()
+            await status.edit_text("\\U0001F399 Распознаю речь (Whisper)...")
+            text = await self._run_sync(
+                self.stt.transcribe_bytes, bytes(raw), fmt
+            )
+            if not text:
+                await status.edit_text("\\u274c Не удалось распознать аудио.")
+                return
+            user_id = update.effective_user.id
+            self._set_session(user_id, text, source="audio")
+            await status.edit_text(
+                f"\\U0001F5E3 **Распознанный текст:**\\n{text[:300]}..."
+            )
+            await self._send_action_keyboard(update, context)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в handle_audio_or_voice")
+            try:
+                await update.message.reply_text(
+                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                )
+            except Exception:
+                pass
 
     @staticmethod
     def _fmt_from_filename(fname):
@@ -733,103 +751,130 @@ class MediaBot:
             return
 
     async def _process_template(self, update, context, template_id):
-        user_id = update.effective_user.id
-        session = self.user_sessions.get(user_id)
-        if not session or not session.get("text"):
+        try:
+            user_id = update.effective_user.id
+            session = self.user_sessions.get(user_id)
+            if not session or not session.get("text"):
+                await update.callback_query.edit_message_text(
+                    "\\u26a0\\ufe0f Сессия устарела — отправьте ссылку/аудио заново."
+                )
+                return
+            templates = self.db.get_templates(user_id)
+            template = templates.get(template_id)
+            if not template:
+                return
             await update.callback_query.edit_message_text(
-                "\\u26a0\\ufe0f Сессия устарела — отправьте ссылку/аудио заново."
+                f"\\U0001F916 Применяю шаблон *{template['name']}*..."
             )
-            return
-        templates = self.db.get_templates(user_id)
-        template = templates.get(template_id)
-        if not template:
-            return
-        await update.callback_query.edit_message_text(
-            f"\\U0001F916 Применяю шаблон *{template['name']}*..."
-        )
-        result = await self.llm.complete(template["prompt"], session["text"])
-        session["chat_history"] = [{"role": "assistant", "content": result}]
-        await self._send_long(update.callback_query.message, result)
-        await update.effective_message.reply_text(
-            "\\U0001F4AC Можно задать вопрос по этому контенту — просто напишите текст."
-        )
+            result = await self.llm.complete(template["prompt"], session["text"])
+            session["chat_history"] = [{"role": "assistant", "content": result}]
+            await self._send_long(update.callback_query.message, result)
+            await update.effective_message.reply_text(
+                "\\U0001F4AC Можно задать вопрос по этому контенту — просто напишите текст."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в _process_template")
+            try:
+                await update.callback_query.edit_message_text(
+                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                )
+            except Exception:
+                pass
 
     async def _show_download_menu(self, update, context):
-        session = self.user_sessions.get(update.effective_user.id)
-        if not session or not session.get("video_id"):
-            await update.callback_query.edit_message_text(
-                "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
-            )
-            return
-        video_id = session["video_id"]
         try:
-            fmts = await self._run_sync(
-                self.yt.list_downloadable_formats, video_id
+            session = self.user_sessions.get(update.effective_user.id)
+            if not session or not session.get("video_id"):
+                await update.callback_query.edit_message_text(
+                    "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
+                )
+                return
+            video_id = session["video_id"]
+            try:
+                fmts = await self._run_sync(
+                    self.yt.list_downloadable_formats, video_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                await update.callback_query.edit_message_text(
+                    f"\\u274c Не удалось получить форматы: {exc}"
+                )
+                return
+            rows = []
+            # Видео-форматы по убыванию разрешения.
+            video_ids = sorted(
+                fmts["video"].items(),
+                key=lambda kv: int(kv[1].replace("p", "")) if kv[1].replace("p", "").isdigit() else 0,
+                reverse=True,
             )
-        except Exception as exc:  # noqa: BLE001
+            for fid, label in video_ids:
+                rows.append([InlineKeyboardButton(
+                    f"\\U0001F3A5 {label}", callback_data=f"{self.CB_DL_VIDEO}{fid}"
+                )])
+            for fid, label in fmts["audio"].items():
+                rows.append([InlineKeyboardButton(
+                    label, callback_data=f"{self.CB_DL_AUDIO}{fid}"
+                )])
             await update.callback_query.edit_message_text(
-                f"\\u274c Не удалось получить форматы: {exc}"
-            )
-            return
-        rows = []
-        # Видео-форматы по убыванию разрешения.
-        video_ids = sorted(
-            fmts["video"].items(),
-            key=lambda kv: int(kv[1].replace("p", "")) if kv[1].replace("p", "").isdigit() else 0,
-            reverse=True,
+                "\\u2b07\\ufe0f **Выберите формат для скачивания:**",
+                reply_markup=InlineKeyboardMarkup(rows),
         )
-        for fid, label in video_ids:
-            rows.append([InlineKeyboardButton(
-                f"\\U0001F3A5 {label}", callback_data=f"{self.CB_DL_VIDEO}{fid}"
-            )])
-        for fid, label in fmts["audio"].items():
-            rows.append([InlineKeyboardButton(
-                label, callback_data=f"{self.CB_DL_AUDIO}{fid}"
-            )])
-        await update.callback_query.edit_message_text(
-            "\\u2b07\\ufe0f **Выберите формат для скачивания:**",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в _show_download_menu")
+            try:
+                await update.callback_query.edit_message_text(
+                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                )
+            except Exception:
+                pass
 
     async def _do_download(self, update, context, data):
-        session = self.user_sessions.get(update.effective_user.id)
-        if not session or not session.get("video_id"):
-            await update.callback_query.edit_message_text(
-                "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
-            )
-            return
-        if data.startswith(self.CB_DL_VIDEO):
-            fmt_id = data[len(self.CB_DL_VIDEO):]
-            format_spec = f"{fmt_id}+bestaudio/best"
-        else:
-            fmt_id = data[len(self.CB_DL_AUDIO):]
-            format_spec = fmt_id
-        await update.callback_query.edit_message_text(
-            "\\u23f3 Скачиваю файл..."
-        )
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                path = await self._run_sync(
-                    self.yt.download, session["video_id"], format_spec, tmp
-                )
-                size = os.path.getsize(path) if os.path.exists(path) else 0
-                if size > 45 * 1024 * 1024:  # лимит Telegram ~50 МБ
-                    await update.callback_query.edit_message_text(
-                        "\\u26a0\\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
-                        "Выберите качество ниже или аудио."
-                    )
-                    return
-                with open(path, "rb") as fh:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id, document=fh
-                    )
+            session = self.user_sessions.get(update.effective_user.id)
+            if not session or not session.get("video_id"):
                 await update.callback_query.edit_message_text(
-                    "\\u2705 Файл отправлен."
+                    "\\u26a0\\ufe0f Скачивание доступно только для YouTube-ссылок."
                 )
-        except Exception as exc:  # noqa: BLE001
+                return
+            if data.startswith(self.CB_DL_VIDEO):
+                fmt_id = data[len(self.CB_DL_VIDEO):]
+                format_spec = f"{fmt_id}+bestaudio/best"
+            else:
+                fmt_id = data[len(self.CB_DL_AUDIO):]
+                format_spec = fmt_id
             await update.callback_query.edit_message_text(
-                f"\\u274c Ошибка скачивания: {exc}"
+                "\\u23f3 Скачиваю файл..."
             )
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = await self._run_sync(
+                        self.yt.download, session["video_id"], format_spec, tmp
+                    )
+                    size = os.path.getsize(path) if os.path.exists(path) else 0
+                    if size > 45 * 1024 * 1024:  # лимит Telegram ~50 МБ
+                        await update.callback_query.edit_message_text(
+                            "\\u26a0\\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
+                            "Выберите качество ниже или аудио."
+                        )
+                        return
+                    with open(path, "rb") as fh:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id, document=fh
+                        )
+                    await update.callback_query.edit_message_text(
+                        "\\u2705 Файл отправлен."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                await update.callback_query.edit_message_text(
+                    f"\\u274c Ошибка скачивания: {exc}"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Ошибка в _do_download")
+            try:
+                await update.callback_query.edit_message_text(
+                    f"\\u26a0\\ufe0f Внутренняя ошибка: {e}"
+                )
+            except Exception:
+                pass
 
     async def _send_long(self, message, text):
         """Отправляет длинный текст кусками по 4000 символов."""
