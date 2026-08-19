@@ -31,15 +31,17 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 
-__version__ = "4.3.4"
+__version__ = "4.5.0"
 VERSION_STRING = __version__  # Keep in sync
 
 import aiohttp
 from pydub import AudioSegment
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -48,6 +50,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+import re as _re_module  # для pattern-фильтра CallbackQueryHandler
 
 # ---------------------------------------------------------------------------
 # Конфигурация из окружения (env-переменные задаются в панели Render).
@@ -67,6 +70,11 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 
 # Сколько секунд аудио держать в памяти для распознавания (меньше = быстрее).
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "1800"))
+
+# Free tier: лимит транскрибаций в месяц (0 = без лимита).
+FREE_TIER_LIMIT = int(os.getenv("FREE_TIER_LIMIT", "10"))
+# Rate limit: секунд между запросами одного пользователя.
+RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "10"))
 
 # YouTube-куки для обхода bot-check (YouTube всё чаще требует авторизацию).
 # Вариант A: путь к файлу с куками (Netscape-формат), экспортировать через
@@ -180,8 +188,94 @@ class BotDatabase:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_stats (
+                user_id INTEGER PRIMARY KEY,
+                count INTEGER DEFAULT 0,
+                last_used REAL DEFAULT 0,
+                month_marker TEXT
+            )
+            """
+        )
         conn.commit()
         conn.close()
+
+    def _current_month(self) -> str:
+        return time.strftime("%Y-%m")
+
+    def check_and_increment_usage(self, user_id: int) -> tuple:
+        """Возвращает (allowed: bool, remaining: int)."""
+        if FREE_TIER_LIMIT <= 0:
+            return True, -1
+        conn = self._conn()
+        cur = conn.cursor()
+        month = self._current_month()
+        try:
+            cur.execute("SELECT count, month_marker FROM usage_stats WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            if row:
+                count, saved_month = row
+                if saved_month != month:
+                    count = 0
+            else:
+                count = 0
+            if count >= FREE_TIER_LIMIT:
+                conn.close()
+                return False, 0
+            new_count = count + 1
+            cur.execute(
+                "INSERT OR REPLACE INTO usage_stats (user_id, count, last_used, month_marker) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, new_count, time.time(), month),
+            )
+            conn.commit()
+            conn.close()
+            return True, FREE_TIER_LIMIT - new_count
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка учёта usage: %s", exc)
+            conn.close()
+            return True, -1
+
+    def check_rate_limit(self, user_id: int) -> tuple:
+        """Возвращает (allowed: bool, wait_seconds: float)."""
+        if RATE_LIMIT_SECONDS <= 0:
+            return True, 0
+        conn = self._conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT last_used FROM usage_stats WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            now = time.time()
+            if row:
+                elapsed = now - row[0]
+                if elapsed < RATE_LIMIT_SECONDS:
+                    conn.close()
+                    return False, RATE_LIMIT_SECONDS - elapsed
+            conn.close()
+            return True, 0
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка rate limit: %s", exc)
+            conn.close()
+            return True, 0
+
+    def get_usage(self, user_id: int) -> dict:
+        conn = self._conn()
+        cur = conn.cursor()
+        try:
+            month = self._current_month()
+            cur.execute("SELECT count, month_marker FROM usage_stats WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            count = 0
+            if row and row[1] == month:
+                count = row[0]
+            conn.close()
+            limit = FREE_TIER_LIMIT if FREE_TIER_LIMIT > 0 else None
+            remaining = (limit - count) if limit else None
+            return {"count": count, "limit": limit, "remaining": remaining}
+        except Exception:  # noqa: BLE001
+            conn.close()
+            return {"count": 0, "limit": FREE_TIER_LIMIT, "remaining": FREE_TIER_LIMIT}
 
     def get_templates(self, user_id: int) -> dict:
         templates = DEFAULT_TEMPLATES.copy()
@@ -327,16 +421,18 @@ class YTClient:
             self._yt_dlp = yt_dlp
         return self._yt_dlp
 
-    def extract_info(self, video_id: str) -> dict:
+    def extract_info(self, video_id: str, extra_opts: dict = None) -> dict:
         """Метаданные видео и список форматов (синхронно, из executor)."""
         yt = self._module()
         url = f"https://www.youtube.com/watch?v={video_id}"
         opts = {"quiet": True, "no_warnings": True, "skip_download": True}
         opts.update(yt_cookie_opts())
+        if extra_opts:
+            opts.update(extra_opts)
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
-    def fetch_subtitles(self, video_id: str) -> str:
+    def fetch_subtitles(self, video_id: str, extra_opts: dict = None) -> str:
         """Возвращает текст субтитров (ru → en → авто), либо пустую строку.
         Raises YouTubeBlockingError if YouTube blocks the request.
         """
@@ -362,6 +458,8 @@ class YTClient:
                 },
             }
             opts.update(yt_cookie_opts())
+            if extra_opts:
+                opts.update(extra_opts)
             try:
                 with yt.YoutubeDL(opts) as ydl:
                     ydl.download([url])
@@ -494,7 +592,7 @@ class YTClient:
             "audio": audio_formats,
         }
 
-    def download(self, video_id: str, format_id: str, dest_dir: str) -> str:
+    def download(self, video_id: str, format_id: str, dest_dir: str, extra_opts: dict = None) -> str:
         """Скачивает конкретный формат, возвращает путь к файлу."""
         yt = self._module()
         url = f"https://www.youtube.com/watch?v={video_id}"
@@ -506,6 +604,8 @@ class YTClient:
             "noplaylist": True,
         }
         opts.update(yt_cookie_opts())
+        if extra_opts:
+            opts.update(extra_opts)
         with yt.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
             return ydl.prepare_filename(info)
@@ -530,11 +630,21 @@ class STTClient:
             logger.info("Whisper-модель %s загружена", self.model_name)
         return self._model
 
-    def transcribe_file(self, path: str) -> str:
-        """Распознаёт аудиофайл локально (faster-whisper)."""
+    def transcribe_file(self, path: str, with_timestamps: bool = False) -> str:
+        """Распознаёт аудиофайл локально (faster-whisper).
+
+        При with_timestamps=True добавляет таймкоды [MM:SS] перед каждой фразой.
+        """
         model = self._ensure_model()
         segments, _info = model.transcribe(path, language="ru")
-        return " ".join(seg.text.strip() for seg in segments)
+        if not with_timestamps:
+            return " ".join(seg.text.strip() for seg in segments)
+        parts = []
+        for seg in segments:
+            mm = int(seg.start // 60)
+            ss = int(seg.start % 60)
+            parts.append(f"[{mm:02d}:{ss:02d}] {seg.text.strip()}")
+        return "\n".join(parts)
 
     def transcribe_bytes(self, data: bytes, fmt: str) -> str:
         """Конвертирует аудио в wav через pydub и распознаёт локально."""
@@ -602,7 +712,33 @@ class MediaBot:
             "Я достану содержание и переработаю его через ИИ.\n\n"
             "**Шаблоны:** саммари · Пирамида Минто · экшен-план · конспект.\n"
             "**Доп. команды:**\n"
-            "\U0001F4DD `/add_template ID | Название | Промпт` — свой шаблон."
+            "\U0001F4DD `/add_template ID | Название | Промпт` — свой шаблон.\n"
+            "\U0001F4CA `/stats` — статистика использования.\n"
+            "\U0001F510 `/bypass` — метод обхода YouTube.\n"
+            "\u2753 `/help` — подробная справка."
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = (
+            f"\u2753 **Справка бота {VERSION_STRING}**\n\n"
+            "**Что я умею:**\n"
+            "\U0001F4FC Пришлите YouTube-ссылку — достану субтитры или распознаю аудио.\n"
+            "\U0001F3A4 Пришлите голосовое или аудиофайл — распознаю речь (Whisper).\n"
+            "\U0001F916 Переработаю текст через ИИ: саммари, Пирамида Минто, экшен-план, конспект.\n"
+            "\u2b07\ufe0f Скачаю видео/аудио в любом качестве.\n\n"
+            "**Команды:**\n"
+            "/start — приветствие\n"
+            "/stats — ваша статистика и лимиты\n"
+            "/bypass — выбор метода обхода YouTube (куки, Chrome, Firefox)\n"
+            "/add_template ID | Название | Промпт — свой шаблон\n"
+            "/help — эта справка\n\n"
+            "**Шаблоны обработки:**\n"
+            "1. Краткое саммари — ключевые мысли списком\n"
+            "2. Пирамида Минто — главное → аргументы\n"
+            "3. Экшен-план — конкретные шаги и задачи\n"
+            "4. Подробный конспект — разделы с заголовками\n\n"
+            "После обработки можно задавать вопросы по контенту текстом."
         )
         await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -637,6 +773,52 @@ class MediaBot:
             user_id = update.effective_user.id
 
             if video_id:
+                # Rate limit
+                allowed, wait = self.db.check_rate_limit(user_id)
+                if not allowed:
+                    await update.message.reply_text(
+                        f"\u23f3 Слишком быстро. Подождите {int(wait) + 1} сек."
+                    )
+                    return
+                # Free tier
+                allowed, remaining = self.db.check_and_increment_usage(user_id)
+                if not allowed:
+                    usage = self.db.get_usage(user_id)
+                    await update.message.reply_text(
+                        f"\u26a0\ufe0f Лимит транскрибаций на месяц исчерпан "
+                        f"({usage['count']}/{usage['limit']}). "
+                        "Обновится в следующем месяце."
+                    )
+                    return
+
+                await context.bot.send_chat_action(
+                    chat_id=update.effective_chat.id, action=ChatAction.TYPING
+                )
+
+                # Проверяем кэш YouTube
+                cached = self.db.get_cached_youtube(video_id)
+                if cached:
+                    self._set_session(
+                        user_id, cached, source="youtube",
+                        video_id=video_id, title="(из кэша)",
+                    )
+                    await update.message.reply_text(
+                        f"\u2705 **Из кэша:**\n\n{cached[:400]}..."
+                    )
+                    await self._send_action_keyboard(update, context)
+                    return
+
+                # Учитываем метод обхода, выбранный через /bypass.
+                try:
+                    from youtube_bypass import get_user_method
+                    method = get_user_method(user_id)
+                except Exception:  # noqa: BLE001
+                    method = "no_cookies"
+                cookie_opts = {}
+                if method == "cookie_file" and YT_COOKIES_FILE:
+                    cookie_opts["cookiefile"] = YT_COOKIES_FILE
+                elif method.startswith("browser_"):
+                    cookie_opts["cookiesfrombrowser"] = (method.replace("browser_", ""),)
                 status = await update.message.reply_text(
                     "\U0001F4E5 Извлекаю видео и субтитры..."
                 )
@@ -644,7 +826,7 @@ class MediaBot:
                 blocked = False
                 try:
                     transcript = await self._run_sync(
-                        self.yt.fetch_subtitles, video_id, timeout=45
+                        self.yt.fetch_subtitles, video_id, cookie_opts, timeout=45
                     )
                 except YouTubeBlockingError as e:
                     # Субтитры заблокированы bot-check → пробуем аудио-fallback.
@@ -654,7 +836,7 @@ class MediaBot:
                     )
                     try:
                         transcript = await asyncio.wait_for(
-                            self._transcribe_youtube_audio(video_id),
+                            self._transcribe_youtube_audio(video_id, cookie_opts=cookie_opts),
                             timeout=60
                         )
                     except YouTubeBlockingError:
@@ -675,7 +857,7 @@ class MediaBot:
                     )
                     try:
                         transcript = await asyncio.wait_for(
-                            self._transcribe_youtube_audio(video_id),
+                            self._transcribe_youtube_audio(video_id, cookie_opts=cookie_opts),
                             timeout=60
                         )
                     except asyncio.TimeoutError:
@@ -687,7 +869,7 @@ class MediaBot:
                     return
                 title = ""
                 try:
-                    info = await self._run_sync(self.yt.extract_info, video_id)
+                    info = await self._run_sync(self.yt.extract_info, video_id, cookie_opts)
                     title = info.get("title", "")
                 except Exception:  # noqa: BLE001
                     pass
@@ -695,6 +877,7 @@ class MediaBot:
                     user_id, transcript, source="youtube",
                     video_id=video_id, title=title,
                 )
+                self.db.save_youtube_cache(video_id, transcript)
                 await status.edit_text(
                     f"\u2705 Готово:\n**{title}**\n\n{transcript[:400]}..."
                 )
@@ -724,7 +907,7 @@ class MediaBot:
             except Exception:
                 pass  # если даже не удалось отправить, просто логгируем
 
-    async def _transcribe_youtube_audio(self, video_id: str, timeout=60) -> str:
+    async def _transcribe_youtube_audio(self, video_id: str, timeout=60, cookie_opts: dict = None) -> str:
         """Скачивает аудио и распознаёт локально (fallback без субтитров).
 
         Raises YouTubeBlockingError если выкачка аудио заблокирована.
@@ -733,7 +916,7 @@ class MediaBot:
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 path = await self._run_sync(
-                    self.yt.download, video_id, "bestaudio", tmp, timeout=timeout
+                    self.yt.download, video_id, "bestaudio", tmp, cookie_opts, timeout=timeout
                 )
                 if not os.path.exists(path):
                     return ""
@@ -753,6 +936,28 @@ class MediaBot:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         try:
+            user_id = update.effective_user.id
+            # Rate limit
+            allowed, wait = self.db.check_rate_limit(user_id)
+            if not allowed:
+                await update.message.reply_text(
+                    f"\u23f3 Слишком быстро. Подождите {int(wait) + 1} сек."
+                )
+                return
+            # Free tier
+            allowed, remaining = self.db.check_and_increment_usage(user_id)
+            if not allowed:
+                usage = self.db.get_usage(user_id)
+                await update.message.reply_text(
+                    f"\u26a0\ufe0f Лимит транскрибаций на месяц исчерпан "
+                    f"({usage['count']}/{usage['limit']}). "
+                    "Обновится в следующем месяце."
+                )
+                return
+
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id, action=ChatAction.TYPING
+            )
             status = await update.message.reply_text("\U0001F4E5 Обрабатываю аудио...")
             is_voice = update.message.voice is not None
             file_obj = update.message.voice if is_voice else update.message.audio
@@ -766,7 +971,6 @@ class MediaBot:
             if not text:
                 await status.edit_text("\u274c Не удалось распознать аудио.")
                 return
-            user_id = update.effective_user.id
             self._set_session(user_id, text, source="audio")
             await status.edit_text(
                 f"\U0001F5E3 **Распознанный текст:**\n{text[:300]}..."
@@ -915,6 +1119,17 @@ class MediaBot:
                     "\u26a0\ufe0f Скачивание доступно только для YouTube-ссылок."
                 )
                 return
+            user_id = update.effective_user.id
+            try:
+                from youtube_bypass import get_user_method
+                method = get_user_method(user_id)
+            except Exception:  # noqa: BLE001
+                method = "no_cookies"
+            cookie_opts = {}
+            if method == "cookie_file" and YT_COOKIES_FILE:
+                cookie_opts["cookiefile"] = YT_COOKIES_FILE
+            elif method.startswith("browser_"):
+                cookie_opts["cookiesfrombrowser"] = (method.replace("browser_", ""),)
             if data.startswith(self.CB_DL_VIDEO):
                 fmt_id = data[len(self.CB_DL_VIDEO):]
                 format_spec = f"{fmt_id}+bestaudio/best"
@@ -927,7 +1142,7 @@ class MediaBot:
             try:
                 with tempfile.TemporaryDirectory() as tmp:
                     path = await self._run_sync(
-                        self.yt.download, session["video_id"], format_spec, tmp
+                        self.yt.download, session["video_id"], format_spec, tmp, cookie_opts
                     )
                     size = os.path.getsize(path) if os.path.exists(path) else 0
                     if size > 45 * 1024 * 1024:  # лимит Telegram ~50 МБ
@@ -960,6 +1175,44 @@ class MediaBot:
         """Отправляет длинный текст кусками по 4000 символов."""
         for idx in range(0, len(text), 4000):
             await message.reply_text(text[idx:idx + 4000])
+
+    # -- Статистика --------------------------------------------------------
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        usage = self.db.get_usage(user_id)
+        try:
+            conn = self.db._conn()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM templates WHERE user_id = ?", (user_id,))
+            user_templates = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM youtube_cache")
+            cached_videos = cur.fetchone()[0]
+            conn.close()
+        except Exception:  # noqa: BLE001
+            user_templates = 0
+            cached_videos = 0
+        active_sessions = len(self.user_sessions)
+        try:
+            from youtube_bypass import get_user_method
+            method = get_user_method(user_id)
+        except Exception:  # noqa: BLE001
+            method = "no_cookies"
+        if usage["limit"]:
+            limit_str = f"{usage['count']}/{usage['limit']}"
+            remaining_str = str(usage["remaining"])
+        else:
+            limit_str = f"{usage['count']} (без лимита)"
+            remaining_str = "∞"
+        text = (
+            f"\U0001F4CA *Статистика бота {VERSION_STRING}*\n\n"
+            f"\U0001F465 Активных сессий: {active_sessions}\n"
+            f"\U0001F4DD Ваших шаблонов: {user_templates}\n"
+            f"\U0001F4FC Видео в кэше: {cached_videos}\n"
+            f"\U0001F510 Метод обхода: {method}\n"
+            f"\U0001F4F2 Транскрибаций за месяц: {limit_str}\n"
+            f"\u2705 Осталось: {remaining_str}"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
 
 # ---------------------------------------------------------------------------
 # Фейковый HTTP-сервер (для Render Free Web Service).
@@ -998,21 +1251,30 @@ def main() -> None:
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", bot.start_command))
+    app.add_handler(CommandHandler("help", bot.help_command))
     app.add_handler(CommandHandler("add_template", bot.add_template_command))
+    app.add_handler(CommandHandler("stats", bot.stats_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
     app.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, bot.handle_audio_or_voice)
     )
-    app.add_handler(CallbackQueryHandler(bot.handle_callback_query))
+    # Основной обработчик кнопок — только для cb-префиксов bot.py,
+    # чтобы не перехватывать bypass-кнопки (у них свой обработчик ниже).
+    app.add_handler(
+        CallbackQueryHandler(
+            bot.handle_callback_query,
+            pattern=_re_module.compile(r'^(tmpl_|dlmenu$|dlv_|dla_)'),
+        )
+    )
 
     # ========================================================================
-    # ИНТЕГРАЦИЯ: YouTube Bypass Interface (v4.3.1)
+    # ИНТЕГРАЦИЯ: YouTube Bypass Interface (v4.4.0)
     # ========================================================================
     try:
         from youtube_bypass import register_youtube_handlers
         register_youtube_handlers(app)
         logger.info("✓ YouTube bypass interface loaded")
-        logger.info("✓ Commands: /bypass, YouTube links")
+        logger.info("✓ Commands: /bypass, callback buttons")
         print("✓ YouTube bypass interface loaded - кнопки должны появиться")
     except Exception as e:
         logger.warning(f"⚠ YouTube bypass not loaded: {e}")
