@@ -1005,6 +1005,17 @@ def main() -> None:
     )
     app.add_handler(CallbackQueryHandler(bot.handle_callback_query))
 
+    # ========================================================================
+    # ИНТЕГРАЦИЯ: YouTube Bypass Interface (v4.3.0)
+    # ========================================================================
+    try:
+        from youtube_bypass import register_youtube_handlers
+        register_youtube_handlers(app)
+        logger.info("✓ YouTube bypass interface loaded")
+        logger.info("✓ Commands: /bypass, YouTube links")
+    except Exception as e:
+        logger.warning(f"⚠ YouTube bypass not loaded: {e}")
+
     print(f"Бот {VERSION_STRING} запущен: polling + health-check сервер.")
     app.run_polling()
 
