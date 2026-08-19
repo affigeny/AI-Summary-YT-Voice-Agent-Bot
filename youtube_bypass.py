@@ -327,9 +327,12 @@ async def handle_youtube_bypass(update: Update, context: ContextTypes.DEFAULT_TY
 # ==================== РЕГИСТРАЦИЯ ====================
 def register_youtube_handlers(dp):
     """Регистрация обработчиков в боте"""
-    from telegram.ext import CommandHandler, MessageHandler, filters
+    from telegram.ext import CommandHandler, MessageHandler, CallbackQueryHandler, filters
     
     dp.add_handler(CommandHandler("bypass", cmd_bypass))
+    dp.add_handler(CallbackQueryHandler(cb_bypass))
     dp.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'https?://.*youtube\.com|https?://.*youtu\.be'), handle_youtube_bypass))
     
     logger.info("✓ YouTube bypass handlers registered")
+    logger.info("✓ Commands: /bypass, YouTube links")
+    logger.info("✓ Callback queries registered")
