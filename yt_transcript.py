@@ -46,8 +46,9 @@ INVIDIOUS_INSTANCES = [
     i.strip().rstrip("/")
     for i in os.getenv(
         "INVIDIOUS_INSTANCES",
+        # Проверены 2026-08-20 (HTTP 200 на captions API):
         "https://inv.nadeko.net, https://invidious.nerdvpn.de, "
-        "https://yewtu.be, https://invidious.privacyredirect.com",
+        "https://yewtu.be",
     ).split(",")
     if i.strip()
 ]
@@ -56,8 +57,8 @@ PIPED_INSTANCES = [
     i.strip().rstrip("/")
     for i in os.getenv(
         "PIPED_INSTANCES",
-        "https://pipedapi.kavin.rocks, https://api.piped.private.coffee, "
-        "https://pipedapi.reallyaweso.me",
+        # Проверены 2026-08-20 (HTTP 200 на streams API):
+        "https://pipedapi.in.projectsegfau.lt, https://watchapi.whatever.social",
     ).split(",")
     if i.strip()
 ]
@@ -416,6 +417,7 @@ FETCH_METHODS = [
     ("piped", "💧 Piped-зеркала", _try_piped),
     ("ytdlp", "🔧 yt-dlp (web)", lambda vid: _try_ytdlp(vid)),
     ("tv", "📺 yt-dlp TV-клиент", lambda vid: _try_ytdlp(vid, client="tv")),
+    ("mweb", "📱 yt-dlp mWeb", lambda vid: _try_ytdlp(vid, client="mweb")),
     ("invidious", "🪞 Invidious-зеркала", _try_invidious),
     ("cookies", "🍪 yt-dlp + куки", lambda vid: _try_ytdlp(vid, use_cookies=True)),
 ]
