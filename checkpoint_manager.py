@@ -235,14 +235,23 @@ def backup_database(db_path: str, vault_path: str = None):
     conn = sqlite3.connect(backup_file)
     cursor = conn.cursor()
     
-    cursor.execute("SELECT COUNT(*) FROM users")
-    users_count = cursor.fetchone()[0]
+    try:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        users_count = cursor.fetchone()[0]
+    except:
+        users_count = 0
     
-    cursor.execute("SELECT COUNT(*) FROM transcriptions")
-    transcriptions_count = cursor.fetchone()[0]
+    try:
+        cursor.execute("SELECT COUNT(*) FROM transcriptions")
+        transcriptions_count = cursor.fetchone()[0]
+    except:
+        transcriptions_count = 0
     
-    cursor.execute("SELECT MAX(created_at) FROM transcriptions")
-    last_transcription = cursor.fetchone()[0]
+    try:
+        cursor.execute("SELECT MAX(created_at) FROM transcriptions")
+        last_transcription = cursor.fetchone()[0]
+    except:
+        last_transcription = "N/A"
     
     conn.close()
     
