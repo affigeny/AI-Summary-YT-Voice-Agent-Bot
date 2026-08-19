@@ -1,56 +1,27 @@
-# YT_Bot_Sum
+# Dockerfile для деплоя Telegram-бота на Render (Web Service, Free)
+# Ставит FFmpeg — обязателен для pydub (декодирование аудио/голосовых).
 
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Telegram](https://img.shields.io/badge/Telegram-Bot-blue.svg)](https://t.me/YT_Bot_Sum_bot)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/affigeny/YT_Bot_Sum/blob/main/LICENSE)
-[![GitHub release](https://img.shields.io/github/v/tag/affigeny/YT_Bot_Sum)](https://github.com/affigeny/YT_Bot_Sum/tags)
-[![Render](https://img.shields.io/badge/Deploy-Render-EB6030?logo=render)](https://render.com/)
+FROM python:3.11-slim
 
-> Telegram-бот для транскрибации аудио/видео в текст с умным обходом YouTube блокировок.
+# FFmpeg — критично: без него pydub не сможет конвертировать аудио
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-## 🚀 Возможности
+WORKDIR /app
 
-| Функция | Описание |
-|---------|----------|
-| 📹 **YouTube / Shorts** | Извлечение субтитров с обходом bot-check |
-| 🎙 **Голосовые / аудио** | Распознавание речи через Whisper |
-| 🤖 **LLM-переработка** | Суммаризация через OpenRouter |
-| 🛠 **Кастомные шаблоны** | Свой промпт для анализа |
-| 💬 **Интерактивный чат** | Диалог с ИИ по контенту |
-| ⬇️ **Скачивание медиа** | Видео/аудио в любом качестве |
-| 🩺 **Health-check** | Обход засыпания на Render Free |
-| 🧪 **YouTube bypass** | 5 методов обхода блокировок |
+# Сначала зависимости (кэшируются отдельным слоем Docker)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-## 🛠 Технологии
+# Потом код
+COPY bot.py .
+COPY youtube_bypass.py .
+COPY transcription.py .
+COPY checkpoint_manager.py .
 
-| Компонент | Технология |
-|-----------|------------|
-| Фреймворк | python-telegram-bot 21.x |
-| Транскрибация | faster-whisper (модель `small`) |
-| YouTube | yt-dlp с browser cookies |
-| LLM | OpenRouter (Nemotron, GPT-4o-mini) |
-| База данных | SQLite |
-| Деплой | Render Web Service (Free) |
-
-## 📦 Установка
-
-```bash
-git clone https://github.com/affigeny/YT_Bot_Sum.git
-cd YT_Bot_Sum
-pip install -r requirements.txt
-```
-
-## 🚀 Деплой
-
-### Локально
-```bash
-python bot.py
-```
-
-### Render (автоматический)
-Репозиторий подключён к Render. Каждый push в `main` вызывает автоматический деплой.
-
-**Проверить статус:** https://render.com/dashboard
+# Запуск бота (polling + фиктивный health-check сервер на $PORT)
+CMD ["python", "bot.py"]
 
 ## 📱 Команды бота
 
