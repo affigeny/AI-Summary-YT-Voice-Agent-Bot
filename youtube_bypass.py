@@ -57,8 +57,9 @@ async def show_bypass_menu(message, db, user_id: int):
     )
     text = (
         "⚙️ Обход блокировок YouTube\n\n"
-        "Транскрипт добывается цепочкой методов: InnerTube API → yt-dlp (web) → "
-        "yt-dlp TV-клиент → Android VR → Invidious-зеркала → Piped-зеркала → куки.\n\n"
+        "Транскрипт добывается цепочкой: InnerTube → Android VR → Piped → "
+        "yt-dlp web → TV → mWeb → Invidious → куки. Если субтитры не прошли — "
+        "бот скачает аудио и распознает речь (Whisper).\n\n"
         f"Текущий режим: <b>{current_label}</b>\n\n"
         "Можно закрепить конкретный метод — он будет пробоваться первым.\n"
         "🤖 Авто — рекомендуется: пробуются все по порядку."
@@ -95,12 +96,12 @@ async def handle_bypass_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def run_test_and_report(query, media_bot, user_id: int):
-    """Прогоняет все методы на тестовом (или последнем) видео и шлёт отчёт."""
+    """Прогоняет все методы (+аудио-fallback) на видео и шлёт отчёт."""
     session = media_bot.user_sessions.get(user_id) or {}
     video_id = session.get("video_id") or YT_TEST_VIDEO
     try:
         await query.edit_message_text(
-            f"🧪 Тестирую все методы на видео {video_id}…\n(до минуты, подождите)"
+            f"🧪 Тестирую все методы на видео {video_id}…\n(до двух минут, подождите)"
         )
     except Exception:  # noqa: BLE001 — старое сообщение могли удалить
         pass
@@ -109,23 +110,44 @@ async def run_test_and_report(query, media_bot, user_id: int):
         yt_transcript.test_methods_sync, video_id, timeout=180
     )
 
-    lines = ["🧪 Тест методов обхода:\n"]
+    lines = ["🧪 Тест методов обхода (субтитры):\n"]
     first_ok = None
     for key, res in results.items():
         icon = "✅" if res["ok"] else "❌"
         lines.append(f"{icon} {res['label']} — {res['note']}")
         if res["ok"] and first_ok is None:
             first_ok = key
+
+    # Аудио-fallback: на датацентровых IP субтитры часто заблокированы,
+    # но аудио качается — тогда бот транскрибирует ссылки через Whisper.
+    try:
+        audio = await media_bot._run_sync(
+            yt_transcript.test_audio_sync, video_id, timeout=240
+        )
+    except Exception as exc:  # noqa: BLE001
+        audio = {"ok": False, "note": str(exc)[:60], "client": ""}
+    icon = "✅" if audio.get("ok") else "❌"
+    lines.append(f"\n{icon} 🎧 Аудио для Whisper — {audio.get('note', 'пропущен')}")
+
     if first_ok:
         media_bot.db.set_bypass_method(user_id, first_ok)
         lines.append(
             f"\n🎯 Рекомендую: <b>{yt_transcript.METHOD_LABELS[first_ok]}</b> "
             "(уже закреплён)."
         )
+    elif audio.get("ok"):
+        lines.append(
+            "\n🎯 Субтитры заблокированы, но аудио качается: ссылки будут "
+            "транскрибированы через Whisper (медленнее, но работает)."
+        )
     else:
         lines.append(
-            "\n⚠️ Ни один метод не сработал. Настройте куки (YT_COOKIES) "
-            "или прокси (YT_PROXY), либо пришлите аудиофайл напрямую."
+            "\n⚠️ Ни субтитры, ни аудио не проходят с этого сервера.\n"
+            "Надёжное решение — куки. Локально выполните:\n"
+            "<code>yt-dlp --cookies-from-browser chrome --cookies cookies.txt \"URL любого видео\"</code>\n"
+            "и вставьте содержимое cookies.txt в переменную YT_COOKIES "
+            "в настройках Render (Env).\n"
+            "Альтернативы: прокси (YT_PROXY) или присылать аудиофайлы напрямую."
         )
     try:
         await query.edit_message_text("\n".join(lines), parse_mode="HTML")

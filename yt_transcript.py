@@ -26,6 +26,7 @@ import html
 import logging
 import os
 import re
+import shutil
 import tempfile
 
 import requests
@@ -491,3 +492,66 @@ def test_methods_sync(video_id: str) -> dict:
                 note = "блокировка YouTube"
             results[key] = {"label": label, "ok": False, "note": note}
     return results
+
+
+def test_audio_sync(video_id: str) -> dict:
+    """Проверяет скачивание аудио — путь Whisper-fallback (/bypass → Тест).
+
+    На датацентровых IP субтитры часто заблокированы, но аудио отдельными
+    клиентами качается: тест показывает, заработает ли транскрипция ссылок
+    через локальное распознавание. Возвращает {"ok", "note", "client"}.
+    """
+    import yt_dlp
+
+    attempts = [("android_vr", False), ("tv", False), ("mweb", False), (None, False)]
+    if get_cookies_file():
+        attempts.append((None, True))
+
+    out_dir = tempfile.mkdtemp(prefix="bypasstest_")
+    last_note = "не пробовалось"
+    try:
+        for client, use_cookies in attempts:
+            label = (client or "web") + ("+куки" if use_cookies else "")
+            opts = _ydl_base_opts()
+            opts.update(
+                {
+                    "skip_download": False,
+                    "format": "bestaudio/best",
+                    "noplaylist": True,
+                    "outtmpl": os.path.join(out_dir, "test.%(ext)s"),
+                }
+            )
+            if client:
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            if use_cookies:
+                opts["cookiefile"] = get_cookies_file()
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(
+                        f"https://www.youtube.com/watch?v={video_id}", download=True
+                    )
+                    path = ydl.prepare_filename(info)
+                if path and os.path.exists(path) and os.path.getsize(path) > 1024:
+                    size_kb = os.path.getsize(path) // 1024
+                    return {
+                        "ok": True,
+                        "note": f"{size_kb} КБ · клиент {label}",
+                        "client": label,
+                    }
+                last_note = f"{label}: файл не появился"
+            except Exception as exc:
+                note = str(exc)[:70]
+                if is_blocking_error(exc):
+                    note = "блокировка YouTube"
+                elif is_video_gone_error(exc):
+                    note = "видео недоступно"
+                last_note = f"{label}: {note}"
+            # чистим недокачанное перед следующей попыткой
+            for fname in os.listdir(out_dir):
+                try:
+                    os.unlink(os.path.join(out_dir, fname))
+                except OSError:
+                    pass
+        return {"ok": False, "note": last_note[:120], "client": ""}
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
