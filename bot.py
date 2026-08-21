@@ -55,7 +55,7 @@ from telegram.ext import (
 import yt_transcript
 from youtube_bypass import handle_bypass_callback, register_bypass_command
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"
 VERSION_STRING = __version__
 
 # ---------------------------------------------------------------------------

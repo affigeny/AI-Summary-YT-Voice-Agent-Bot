@@ -57,9 +57,11 @@ async def show_bypass_menu(message, db, user_id: int):
     )
     text = (
         "⚙️ Обход блокировок YouTube\n\n"
-        "Транскрипт добывается цепочкой: InnerTube → Android VR → Piped → "
-        "yt-dlp web → TV → mWeb → Invidious → куки. Если субтитры не прошли — "
-        "бот скачает аудио и распознает речь (Whisper).\n\n"
+        "Транскрипт добывается цепочкой: InnerTube → kome.ai → Android VR → "
+        "Piped → yt-dlp web → TV → mWeb → Invidious → куки. kome.ai тянет "
+        "транскрипт со своих серверов — работает даже там, где YouTube "
+        "блокирует наш IP. Если субтитры не прошли — бот скачает аудио и "
+        "распознает речь (Whisper).\n\n"
         f"Текущий режим: <b>{current_label}</b>\n\n"
         "Можно закрепить конкретный метод — он будет пробоваться первым.\n"
         "🤖 Авто — рекомендуется: пробуются все по порядку."

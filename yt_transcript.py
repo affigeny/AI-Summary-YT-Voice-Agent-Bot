@@ -247,6 +247,51 @@ def _try_innertube(video_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Метод 2: публичный API kome.ai (внешний сервис).
+# ---------------------------------------------------------------------------
+# kome.ai тянет транскрипт со СВОИХ серверов, поэтому метод работает даже с
+# датацентровых IP (Render), которые YouTube блокирует. Особенность: при
+# отсутствии субтитров возвращает HTTP 200 с текстом-извинением — детектим.
+_KOME_UNAVAILABLE_MARKERS = (
+    "transcripts aren't available",
+    "aren't available for this video",
+)
+
+
+def _try_kome(video_id: str):
+    """Транскрипт через публичный API kome.ai (внешние серверы)."""
+    try:
+        resp = requests.post(
+            "https://kome.ai/api/transcript",
+            json={"video_id": video_id, "format": True},
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Content-Type": "application/json",
+                "Accept": "*/*",
+                "Origin": "https://kome.ai",
+                "Referer": "https://kome.ai/tools/youtube-transcript-generator",
+            },
+            # kome.ai — не YouTube-эндпоинт, YT_PROXY тут не нужен.
+            timeout=45,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"kome.ai недоступен ({type(exc).__name__})") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(f"kome.ai: HTTP {resp.status_code}")
+    try:
+        text = (resp.json() or {}).get("transcript") or ""
+    except ValueError as exc:
+        raise RuntimeError("kome.ai: некорректный JSON") from exc
+    lowered = text.lower()
+    if any(marker in lowered for marker in _KOME_UNAVAILABLE_MARKERS):
+        raise RuntimeError("нет субтитров (kome.ai)")
+    text = _clean_text(text)
+    if not text:
+        raise RuntimeError("kome.ai: пустой транскрипт")
+    return text, None, None
+
+
+# ---------------------------------------------------------------------------
 # yt-dlp: субтитры из info-dict (ручные + автогенерация).
 # ---------------------------------------------------------------------------
 def _ydl_base_opts():
@@ -414,6 +459,7 @@ def _try_piped(video_id: str):
 # ---------------------------------------------------------------------------
 FETCH_METHODS = [
     ("innertube", "⚡ InnerTube API", _try_innertube),
+    ("kome", "🛰️ kome.ai API", _try_kome),
     ("android", "🤖 yt-dlp Android VR", lambda vid: _try_ytdlp(vid, client="android_vr")),
     ("piped", "💧 Piped-зеркала", _try_piped),
     ("ytdlp", "🔧 yt-dlp (web)", lambda vid: _try_ytdlp(vid)),
