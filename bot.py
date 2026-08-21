@@ -63,8 +63,8 @@ VERSION_STRING = __version__
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_API_URL = os.getenv("AI_API_URL", "https://openrouter.ai/api/v1")
-AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.0-flash-exp:free")
+AI_API_URL = os.getenv("AI_API_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 PORT = int(os.getenv("PORT", "10000"))
 

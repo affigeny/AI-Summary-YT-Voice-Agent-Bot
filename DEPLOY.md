@@ -9,7 +9,9 @@
 2. **FFmpeg обязателен.** `pydub` не декодирует аудио/голос без FFmpeg — бот
    падал на первом голосовом. `Dockerfile` ставит FFmpeg.
 3. **OpenAI-совместимый endpoint.** Код шлёт запрос на `{AI_API_URL}/chat/completions`.
-   Рекомендуемый провайдер — OpenRouter (`https://openrouter.ai/api/v1`).
+   Провайдер — Google Gemini через `https://generativelanguage.googleapis.com/v1beta/openai`
+   (бесплатно, не нужен OpenRouter). Формат `messages` и `choices[0].message.content`
+   совпадают со схемой OpenAI, поэтому `LLMClient` работает без изменений.
 
 ## Подготовлено
 
@@ -30,9 +32,9 @@
 4. **Env vars**:
    - `TELEGRAM_BOT_TOKEN` = токен от BotFather
    - `AI_PROVIDER` = `openai`
-   - `AI_API_URL` = `https://openrouter.ai/api/v1`
-   - `AI_API_KEY` = `sk-or-v1-...` (OpenRouter)
-   - `AI_MODEL` = `google/gemini-2.0-flash-exp:free` (бесплатная через OpenRouter)
+   - `AI_API_URL` = `https://generativelanguage.googleapis.com/v1beta/openai`
+   - `AI_API_KEY` = `AQ.Ab8...Google...`
+   - `AI_MODEL` = `gemini-3.6-flash`
    - `DB_PATH` = `/var/data/bot_database.db`
    - `YT_COOKIES_FILE` (опц.) = `/var/data/cookies.txt` — см. ниже про bot-check
 5. **Deploy** и следи за логами.
