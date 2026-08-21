@@ -1,6 +1,6 @@
 python-telegram-bot>=21.0
-yt-dlp>=2025.1.1
-youtube-transcript-api>=1.0.0
-faster-whisper>=1.0.0
+yt-dlp>=2024.8.6
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
 aiohttp>=3.9.0
 requests>=2.31.0

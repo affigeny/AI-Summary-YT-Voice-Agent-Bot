@@ -1,5 +1,5 @@
 # Dockerfile для деплоя Telegram-бота на Render (Web Service, Free)
-# FFmpeg — запасной декодер (faster-whisper обычно тащит свой libav через pip).
+# FFmpeg нужен pydub для декодирования аудио/видео перед распознаванием речи.
 
 FROM python:3.11-slim
 
