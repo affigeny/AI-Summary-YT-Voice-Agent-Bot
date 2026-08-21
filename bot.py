@@ -62,7 +62,7 @@ from telegram.ext import (
 import yt_transcript
 from youtube_bypass import handle_bypass_callback, register_bypass_command
 
-__version__ = "6.0.0"
+__version__ = "6.1.0"
 VERSION_STRING = __version__
 
 # ---------------------------------------------------------------------------
@@ -88,6 +88,17 @@ YT_DOWNLOAD_TIMEOUT = int(os.getenv("YT_DOWNLOAD_TIMEOUT", "300"))
 # Лимиты LLM: длинный транскрипт урезаем до LLM_MAX_CHARS (голова+хвост).
 LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "24000"))
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "240"))
+
+# Сколько последних сообщений диалога отправлять в LLM (защита от переполнения
+# контекста: транскрипт уже занимает до LLM_MAX_CHARS).
+HISTORY_MAX_MESSAGES = int(os.getenv("HISTORY_MAX_MESSAGES", "12"))
+
+# Максимум символов на одно сообщение диалога (ответы ИИ бывают огромными и
+# при обсуждении быстро переполняют контекст → HTTP 400 у провайдера).
+HISTORY_MSG_MAX_CHARS = int(os.getenv("HISTORY_MSG_MAX_CHARS", "4000"))
+
+# Префикс, по которому распознаём неудачный ответ LLM (для кнопки «Повторить»).
+LLM_ERROR_PREFIX = "\u26a0\ufe0f"
 
 # Telegram Bot API не позволяет боту скачивать файлы больше 20 МБ.
 TELEGRAM_FILE_LIMIT = 20 * 1024 * 1024
@@ -470,6 +481,28 @@ class LLMClient:
             + text[-tail:]
         )
 
+    @staticmethod
+    def _sanitize(messages: list) -> list:
+        """Готовит messages под строгие OpenAI-совместимые API (в т.ч. Gemini).
+
+        Убирает пустые сообщения и склеивает подряд идущие с одной ролью —
+        Gemini отвечает HTTP 400 на дубли ролей и пустой content.
+        """
+        cleaned = []
+        for msg in messages:
+            content = (msg.get("content") or "").strip()
+            role = msg.get("role")
+            if not content or role not in ("system", "user", "assistant"):
+                continue
+            if cleaned and cleaned[-1]["role"] == role:
+                cleaned[-1]["content"] += "\n\n" + content
+            else:
+                cleaned.append({"role": role, "content": content})
+        # После system первым обязан идти user.
+        if len(cleaned) > 1 and cleaned[1]["role"] == "assistant":
+            cleaned.insert(1, {"role": "user", "content": "Продолжай."})
+        return cleaned
+
     async def complete(self, prompt: str, context_text: str, history=None, retries=2):
         if not self.api_key:
             return (
@@ -497,10 +530,19 @@ class LLMClient:
                 }
             )
         if history:
-            messages.extend(history)
-        else:
+            # Берём только последние сообщения: транскрипт уже занимает
+            # почти весь бюджет контекста, длинный диалог ломает запрос.
+            trimmed = []
+            for msg in history[-HISTORY_MAX_MESSAGES:]:
+                content = (msg.get("content") or "")
+                if len(content) > HISTORY_MSG_MAX_CHARS:
+                    content = content[:HISTORY_MSG_MAX_CHARS] + "\n[…обрезано…]"
+                trimmed.append({"role": msg.get("role"), "content": content})
+            messages.extend(trimmed)
+        if prompt:
             messages.append({"role": "user", "content": prompt})
 
+        messages = self._sanitize(messages)
         payload = {"model": self.model, "messages": messages, "temperature": 0.5}
         headers = {
             "Content-Type": "application/json",
@@ -508,6 +550,7 @@ class LLMClient:
         }
         timeout = aiohttp.ClientTimeout(total=LLM_TIMEOUT)
 
+        last_reason = ""
         for attempt in range(retries + 1):
             try:
                 async with aiohttp.ClientSession() as session:
@@ -519,26 +562,57 @@ class LLMClient:
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            content = data["choices"][0]["message"]["content"]
-                            return content.strip()
-                        body = (await resp.text())[:200]
-                        logger.warning(
-                            "LLM HTTP %s: %s", resp.status, body
-                        )
+                            choices = data.get("choices") or []
+                            if not choices:
+                                last_reason = "пустой ответ модели"
+                                await asyncio.sleep((attempt + 1) * 2)
+                                continue
+                            content = (
+                                choices[0].get("message", {}).get("content") or ""
+                            ).strip()
+                            if not content:
+                                last_reason = "модель вернула пустой текст"
+                                await asyncio.sleep((attempt + 1) * 2)
+                                continue
+                            return content
+                        body = (await resp.text())[:300]
+                        logger.warning("LLM HTTP %s: %s", resp.status, body)
+                        last_reason = self._explain_http(resp.status, body)
                         if resp.status not in (429, 500, 502, 503, 504):
-                            return (
-                                f"\u26a0\ufe0f Ошибка нейросети (HTTP {resp.status}). "
-                                "Проверьте AI_API_KEY / AI_MODEL."
-                            )
+                            return f"\u26a0\ufe0f {last_reason}"
                         await asyncio.sleep((attempt + 1) * 2)
+            except asyncio.TimeoutError:
+                last_reason = f"модель не ответила за {LLM_TIMEOUT} с"
+                logger.warning("LLM timeout")
+                await asyncio.sleep((attempt + 1) * 2)
             except Exception as exc:  # noqa: BLE001
+                last_reason = f"сетевая ошибка: {str(exc)[:80]}"
                 logger.warning("LLM error: %s", exc)
                 await asyncio.sleep((attempt + 1) * 2)
 
         return (
-            "\u26a0\ufe0f Облачный ИИ сейчас недоступен. "
-            "Пожалуйста, повторите попытку позже."
+            f"\u26a0\ufe0f Не удалось получить ответ ИИ ({last_reason or 'причина неизвестна'}).\n"
+            "Нажмите «\u267b\ufe0f Повторить» — часто помогает со второго раза."
         )
+
+    @staticmethod
+    def _explain_http(status: int, body: str) -> str:
+        """Человеческое объяснение ошибки вместо сухого HTTP-кода."""
+        low = body.lower()
+        if status == 400 and ("token" in low or "too long" in low or "exceed" in low):
+            return (
+                "текст слишком длинный для модели. Уменьшите LLM_MAX_CHARS "
+                "или начните новое обсуждение (кнопка «Другой шаблон»)"
+            )
+        if status in (401, 403):
+            return "ключ AI_API_KEY отклонён провайдером — проверьте ключ и модель"
+        if status == 404:
+            return f"модель {'не найдена'} — проверьте AI_MODEL и AI_API_URL"
+        if status == 429:
+            return "превышен лимит запросов провайдера — подождите минуту"
+        if status == 400:
+            return f"провайдер отклонил запрос (HTTP 400): {body[:120]}"
+        return f"ошибка провайдера HTTP {status}"
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +818,9 @@ class MediaBot:
     CB_TMPL_DEL = "td:"         # удалить свой шаблон
     CB_OUT_MENU = "outmenu"     # выбрать формат вывода
     CB_OUT_SET = "outset:"      # установить формат вывода (tg/md/both)
+    CB_MENU = "menu"            # вернуть главное меню действий
+    CB_RETRY = "retry"          # повторить последний шаблон
+    CB_DISCUSS = "disc:"        # выбрать, что обсуждать (transcript|result)
 
     # Форматы вывода результата.
     OUT_TG = "tg"      # только в чат
@@ -780,6 +857,9 @@ class MediaBot:
             "video_id": video_id,
             "title": title,
             "transcript_id": transcript_id,
+            "last_template_id": None,   # для «♻️ Повторить»
+            "last_result": None,        # последний ответ ИИ
+            "discuss_target": "transcript",  # что обсуждаем: transcript | result
         }
 
     async def _run_sync(self, func, *args, timeout=None):
@@ -831,17 +911,26 @@ class MediaBot:
         await update.message.reply_text(
             "\U0001F4D8 Как пользоваться\n\n"
             "1. Пришлите ссылку YouTube / ID видео / аудио / голосовое.\n"
-            "2. Транскрипт сохраняется; появятся кнопки шаблонов.\n"
-            "3. Нажмите шаблон — получите результат; дальше можно просто "
-            "писать вопросы по тексту.\n\n"
+            "2. Появится меню обработки — выберите шаблон.\n"
+            "3. После результата меню не исчезает: можно повторить обработку, "
+            "выбрать другой шаблон или задать вопрос текстом.\n\n"
+            "\u2699\ufe0f Меню обработки — кнопка внизу, открывает шаблоны в любой момент.\n\n"
+            "\U0001F4AC Обсуждение\n"
+            "После обработки вопросы по умолчанию идут по РЕЗУЛЬТАТУ ИИ. "
+            "Кнопкой «Обсуждаем: …» можно переключиться на исходный транскрипт. "
+            "Если вопрос не прошёл — «Сбросить диалог» и спросить короче.\n\n"
+            "\u2699\ufe0f Формат вывода: в чат · .md файлом · оба. "
+            "Меняется в любой момент, применяется к следующей обработке "
+            "(или сразу — кнопкой «Повторить в этом формате»).\n\n"
+            "\U0001F4DD Шаблоны: видно полный текст промпта, можно изменить "
+            "или создать свой.\n\n"
             "\U0001F527 Команды\n"
-            "/bypass — выбор метода обхода блокировок + тест методов\n"
-            "/add_template ID | Название | Промпт — свой шаблон\n"
-            "/templates, /del_template ID\n"
-            "/history — последние транскрипты (можно обработать заново)\n"
+            "/bypass — метод обхода блокировок YouTube + тест\n"
+            "/templates, /add_template, /del_template, /cancel\n"
+            "/history — последние транскрипты\n"
             "/stats — статистика\n\n"
-            "\U0001F510 Приватность: транскрипты хранятся в БД бота и доступны "
-            "только вам через /history."
+            "\U0001F510 Транскрипты хранятся в БД бота и доступны только вам.",
+            reply_markup=self.PERSISTENT_KB,
         )
 
     async def add_template_command(
@@ -929,6 +1018,7 @@ class MediaBot:
     KB_HISTORY = "\U0001F559 История"
     KB_OUTPUT = "\u2699\ufe0f Формат вывода"
     KB_BYPASS = "\U0001F513 Обход YouTube"
+    KB_MENU = "\u2699\ufe0f Меню обработки"
     KB_HELP = "\u2139\ufe0f Помощь"
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -937,6 +1027,19 @@ class MediaBot:
             user_id = update.effective_user.id
 
             # 0. Кнопки постоянной reply-клавиатуры.
+            if text == self.KB_MENU:
+                session = self.user_sessions.get(user_id)
+                if session and session.get("text"):
+                    await self._send_action_keyboard(update, context)
+                else:
+                    await update.message.reply_text(
+                        "Сначала пришлите ссылку YouTube, голосовое или аудио — "
+                        "затем появится меню обработки.\n"
+                        "Или откройте \U0001F559 Историю, чтобы вернуться "
+                        "к сохранённому транскрипту.",
+                        reply_markup=self.PERSISTENT_KB,
+                    )
+                return
             if text == self.KB_TEMPLATES:
                 await self._show_templates_menu(update, context)
                 return
@@ -976,14 +1079,27 @@ class MediaBot:
                     return
                 try:
                     status = await update.message.reply_text("\U0001F916 Думаю…")
-                    session["chat_history"].append({"role": "user", "content": text})
-                    reply = await self.llm.complete(
-                        "", session["text"], session["chat_history"]
-                    )
-                    session["chat_history"].append(
-                        {"role": "assistant", "content": reply}
-                    )
-                    await self._send_long(status, reply)
+                    # Что берём в контекст: результат обработки или транскрипт.
+                    target = session.get("discuss_target", "transcript")
+                    if target == "result" and session.get("last_result"):
+                        base_context = (
+                            "Результат предыдущей обработки текста:\n\n"
+                            f"{session['last_result']}"
+                        )
+                    else:
+                        base_context = session["text"]
+
+                    history = list(session.get("chat_history") or [])
+                    history.append({"role": "user", "content": text})
+                    reply = await self.llm.complete("", base_context, history)
+                    if reply.startswith(LLM_ERROR_PREFIX):
+                        # Историю не портим неудачным ответом, даём кнопки.
+                        await self._safe_edit(status, reply)
+                        await self._send_discuss_error_keyboard(update, context)
+                    else:
+                        history.append({"role": "assistant", "content": reply})
+                        session["chat_history"] = history
+                        await self._send_long(status, reply)
                 finally:
                     self._release_user(user_id)
             else:
@@ -1002,6 +1118,31 @@ class MediaBot:
         self._pending_template.pop(update.effective_user.id, None)
         await update.message.reply_text(
             "\u274c Отменено.", reply_markup=self.PERSISTENT_KB
+        )
+
+    async def _send_discuss_error_keyboard(self, update, context):
+        """Кнопки после неудачного вопроса в обсуждении."""
+        session = self.user_sessions.get(update.effective_user.id) or {}
+        target = session.get("discuss_target", "transcript")
+        rows = [
+            [InlineKeyboardButton(
+                "\U0001F5D1 Сбросить диалог и спросить заново",
+                callback_data=f"{self.CB_DISCUSS}reset",
+            )],
+            [InlineKeyboardButton(
+                ("\U0001F504 Обсуждать транскрипт" if target == "result"
+                 else "\U0001F504 Обсуждать результат ИИ"),
+                callback_data=f"{self.CB_DISCUSS}toggle",
+            )],
+            [InlineKeyboardButton(
+                "\U0001F4DD Выбрать шаблон обработки", callback_data=self.CB_MENU
+            )],
+        ]
+        await update.effective_message.reply_text(
+            "\u26a0\ufe0f Вопрос не прошёл. Частая причина — контекст слишком "
+            "разросся. Сбросьте диалог и спросите короче, либо переключите, "
+            "что именно обсуждаем.",
+            reply_markup=InlineKeyboardMarkup(rows),
         )
 
     async def _finish_template_input(self, update, context, pending, text):
@@ -1295,13 +1436,14 @@ class MediaBot:
     # -- Инлайн-интерфейс ---------------------------------------------------
     PERSISTENT_KB = ReplyKeyboardMarkup(
         [
+            [KeyboardButton("\u2699\ufe0f Меню обработки")],
             [KeyboardButton("\U0001F4DD Шаблоны"), KeyboardButton("\U0001F559 История")],
             [KeyboardButton("\u2699\ufe0f Формат вывода"), KeyboardButton("\U0001F513 Обход YouTube")],
             [KeyboardButton("\u2139\ufe0f Помощь")],
         ],
         resize_keyboard=True,
         is_persistent=True,
-        input_field_placeholder="Пришлите ссылку YouTube, голосовое или аудио…",
+        input_field_placeholder="Ссылка YouTube, голосовое, аудио — или вопрос по тексту…",
     )
 
     def _action_keyboard(self, user_id: int, has_video: bool) -> InlineKeyboardMarkup:
@@ -1407,6 +1549,70 @@ class MediaBot:
         if data == self.CB_TMPL_NEW:
             await self._start_new_template(update, context)
             return
+        if data == self.CB_MENU:
+            await self._send_action_keyboard(update, context)
+            return
+        if data == self.CB_RETRY:
+            await self._retry_last_template(update, context)
+            return
+        if data.startswith(self.CB_DISCUSS):
+            action = data[len(self.CB_DISCUSS):]
+            if action == "reset":
+                await self._reset_discussion(update, context)
+            else:
+                await self._toggle_discuss_target(update, context)
+            return
+
+    # -- Повтор обработки и выбор объекта обсуждения ------------------------
+    async def _reset_discussion(self, update, context):
+        """Сбрасывает историю диалога, сохраняя транскрипт и результат."""
+        session = self.user_sessions.get(update.effective_user.id)
+        if not session:
+            await self._safe_edit(
+                update.callback_query.message, "\u26a0\ufe0f Сессия устарела."
+            )
+            return
+        session["chat_history"] = []
+        await self._safe_edit(
+            update.callback_query.message,
+            "\U0001F5D1 Диалог сброшен. Транскрипт и результат сохранены — "
+            "задайте вопрос заново.",
+        )
+
+    async def _retry_last_template(self, update, context):
+        """Повторяет последний шаблон (после ошибки ИИ или просто ещё раз)."""
+        user_id = update.effective_user.id
+        session = self.user_sessions.get(user_id) or {}
+        tid = session.get("last_template_id")
+        if not tid:
+            await self._send_action_keyboard(update, context)
+            return
+        await self._process_template(update, context, tid)
+
+    async def _toggle_discuss_target(self, update, context):
+        """Переключает, что берётся в контекст при обсуждении текстом."""
+        user_id = update.effective_user.id
+        session = self.user_sessions.get(user_id)
+        if not session:
+            await self._safe_edit(
+                update.callback_query.message, "\u26a0\ufe0f Сессия устарела."
+            )
+            return
+        cur = session.get("discuss_target", "result")
+        new = "transcript" if cur == "result" else "result"
+        if new == "result" and not session.get("last_result"):
+            new = "transcript"
+        session["discuss_target"] = new
+        # Диалог начинаем заново, чтобы контекст не смешивался.
+        session["chat_history"] = []
+        label = (
+            "результат обработки ИИ" if new == "result" else "исходный транскрипт"
+        )
+        await self._safe_edit(
+            update.callback_query.message,
+            f"\u2705 Теперь вопросы обсуждаются по: {label}.\n"
+            "История диалога сброшена — задайте вопрос текстом.",
+        )
 
     # -- Формат вывода ------------------------------------------------------
     async def _show_output_menu(self, update, context):
@@ -1445,9 +1651,22 @@ class MediaBot:
         self.db.set_output_format(update.effective_user.id, fmt)
         label = {"tg": "только в чат", "md": "только .md файлом",
                  "both": "в чат + .md файл"}[fmt]
+        session = self.user_sessions.get(update.effective_user.id) or {}
+        rows = []
+        if session.get("last_template_id"):
+            rows.append([InlineKeyboardButton(
+                "\u267b\ufe0f Повторить обработку в этом формате",
+                callback_data=self.CB_RETRY,
+            )])
+        rows.append([InlineKeyboardButton(
+            "\U0001F4DD Выбрать шаблон обработки", callback_data=self.CB_MENU
+        )])
         await self._safe_edit(
             update.callback_query.message,
-            f"\u2705 Формат вывода: {label}.\nТеперь выберите шаблон обработки.",
+            f"\u2705 Формат вывода: {label}.",
+        )
+        await update.effective_message.reply_text(
+            "Дальше:", reply_markup=InlineKeyboardMarkup(rows)
         )
 
     # -- Меню шаблонов (просмотр текста, создание, редактирование) ----------
@@ -1570,21 +1789,85 @@ class MediaBot:
             if not template:
                 await self._safe_edit(query.message, "\u26a0\ufe0f Шаблон не найден.")
                 return
-            await self._safe_edit(
-                query.message,
-                f"\U0001F916 Применяю шаблон «{template['name']}»…",
-            )
-            result = await self.llm.complete(template["prompt"], session["text"])
-            session["chat_history"] = [{"role": "assistant", "content": result}]
-            await self._deliver_result(
-                update, context, result, template["name"], session,
-            )
-            await query.message.reply_text(
-                "\U0001F4AC Можно задать вопрос по этому тексту — просто напишите."
-            )
+            busy_error = await self._acquire_user(update.effective_user.id)
+            if busy_error:
+                await query.message.reply_text(busy_error)
+                return
+            try:
+                await self._safe_edit(
+                    query.message,
+                    f"\U0001F916 Применяю шаблон «{template['name']}»…",
+                )
+                result = await self.llm.complete(template["prompt"], session["text"])
+                failed = result.startswith(LLM_ERROR_PREFIX)
+                session["last_template_id"] = template_id
+                if not failed:
+                    session["last_result"] = result
+                    session["chat_history"] = [
+                        {"role": "user", "content": template["prompt"]},
+                        {"role": "assistant", "content": result},
+                    ]
+                    session["discuss_target"] = "result"
+                    await self._deliver_result(
+                        update, context, result, template["name"], session,
+                    )
+                else:
+                    # Ошибка ИИ: показываем причину и даём повтор/смену шаблона.
+                    await update.effective_message.reply_text(result)
+                await self._send_after_result_keyboard(update, context, failed=failed)
+            finally:
+                self._release_user(update.effective_user.id)
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в _process_template")
             await self._safe_edit(query.message, f"\u26a0\ufe0f Внутренняя ошибка: {e}")
+            await self._send_after_result_keyboard(update, context, failed=True)
+
+    async def _send_after_result_keyboard(self, update, context, failed=False):
+        """Меню после обработки: повтор, другой шаблон, что обсуждать, вывод."""
+        user_id = update.effective_user.id
+        session = self.user_sessions.get(user_id) or {}
+        rows = []
+        if failed:
+            rows.append([InlineKeyboardButton(
+                "\u267b\ufe0f Повторить этот шаблон", callback_data=self.CB_RETRY
+            )])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    "\u267b\ufe0f Ещё раз", callback_data=self.CB_RETRY
+                ),
+                InlineKeyboardButton(
+                    "\U0001F504 Другой шаблон", callback_data=self.CB_MENU
+                ),
+            ])
+            target = session.get("discuss_target", "result")
+            rows.append([InlineKeyboardButton(
+                ("\U0001F4AC Обсуждаем: результат \u2192 переключить на транскрипт"
+                 if target == "result"
+                 else "\U0001F4AC Обсуждаем: транскрипт \u2192 переключить на результат"),
+                callback_data=f"{self.CB_DISCUSS}toggle",
+            )])
+        if failed:
+            rows.append([InlineKeyboardButton(
+                "\U0001F504 Выбрать другой шаблон", callback_data=self.CB_MENU
+            )])
+        rows.append([
+            InlineKeyboardButton(
+                "\u2699\ufe0f Формат вывода", callback_data=self.CB_OUT_MENU
+            ),
+            InlineKeyboardButton(
+                "\U0001F4C4 Транскрипт", callback_data=self.CB_TXT
+            ),
+        ])
+        hint = (
+            "\u26a0\ufe0f ИИ не справился. Можно повторить или выбрать другой шаблон."
+            if failed else
+            "\U0001F4AC Дальше: задайте вопрос текстом, повторите обработку "
+            "или выберите другой шаблон."
+        )
+        await update.effective_message.reply_text(
+            hint, reply_markup=InlineKeyboardMarkup(rows)
+        )
 
     async def _deliver_result(self, update, context, result, template_name, session):
         """Выдаёт результат согласно выбранному формату вывода (tg/md/both)."""
