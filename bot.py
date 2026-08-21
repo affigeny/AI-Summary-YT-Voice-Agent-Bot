@@ -9,7 +9,7 @@
   1. Достаёт транскрипт: цепочка методов обхода блокировок YouTube
      (InnerTube API → yt-dlp web → TV-клиент → Android VR → Invidious →
      Piped → куки; см. yt_transcript.py), а если субтитров нет — скачивает
-     аудио и распознаёт речь локально (faster-whisper).
+     аудио и распознаёт речь (Google Speech, бесплатно, без загрузки моделей).
   2. Сохраняет транскрипт в БД (/history — вернуться к любому).
   3. Перерабатывает текст через LLM (OpenAI-совместимый API) по шаблону:
      стандартные (саммари / Минто / экшен-план / конспект) или свои
@@ -21,7 +21,7 @@
   BotDatabase  — SQLite (шаблоны, транскрипты, кэш YouTube, история, настройки);
   LLMClient    — обращение к LLM-провайдеру;
   YTClient     — метаданные/форматы/скачивание через yt-dlp;
-  STTClient    — распознавание речи (faster-whisper локально);
+  STTClient    — распознавание речи (Google Speech Recognition);
   MediaBot     — Telegram-обработчики и инлайн-интерфейс (единый диспетчер
                  колбэков — никаких конфликтующих CallbackQueryHandler);
   yt_transcript — движок получения транскрипта с обходом блокировок;
@@ -42,7 +42,14 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiohttp
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -55,7 +62,7 @@ from telegram.ext import (
 import yt_transcript
 from youtube_bypass import handle_bypass_callback, register_bypass_command
 
-__version__ = "5.2.0"
+__version__ = "6.0.0"
 VERSION_STRING = __version__
 
 # ---------------------------------------------------------------------------
@@ -68,12 +75,13 @@ AI_MODEL = os.getenv("AI_MODEL", "gemini-3.6-flash")
 DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Модель локального распознавания речи (faster-whisper).
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
+# Язык распознавания речи (Google Speech). ru-RU по умолчанию.
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "ru-RU")
 
-# Лимиты аудио и таймауты: распознавание на CPU Render Free — минуты, не секунды.
+# Лимиты аудио и таймауты распознавания (Google Speech — быстро, но чанками).
 MAX_AUDIO_SECONDS = int(os.getenv("MAX_AUDIO_SECONDS", "1800"))
-WHISPER_TIMEOUT = int(os.getenv("WHISPER_TIMEOUT", "900"))   # на одно аудио
+STT_CHUNK_SECONDS = int(os.getenv("STT_CHUNK_SECONDS", "50"))  # <60 с на чанк
+STT_TIMEOUT = int(os.getenv("STT_TIMEOUT", "600"))   # на одно аудио
 YT_FETCH_TIMEOUT = int(os.getenv("YT_FETCH_TIMEOUT", "180"))  # на цепочку методов
 YT_DOWNLOAD_TIMEOUT = int(os.getenv("YT_DOWNLOAD_TIMEOUT", "300"))
 
@@ -198,10 +206,16 @@ class BotDatabase:
             """
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
-                bypass_method TEXT DEFAULT 'auto'
+                bypass_method TEXT DEFAULT 'auto',
+                output_format TEXT DEFAULT 'tg'
             )
             """
         )
+        # Миграция: добавить output_format, если таблица была создана ранее.
+        try:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN output_format TEXT DEFAULT 'tg'")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
         conn.commit()
         conn.close()
 
@@ -286,6 +300,38 @@ class BotDatabase:
             conn.close()
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка записи настроек: %s", exc)
+
+    def get_output_format(self, user_id: int) -> str:
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT output_format FROM user_settings WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            conn.close()
+            return (row[0] if row and row[0] else "tg")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка чтения формата вывода: %s", exc)
+            return "tg"
+
+    def set_output_format(self, user_id: int, fmt: str):
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO user_settings (user_id, output_format)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET output_format = excluded.output_format
+                """,
+                (user_id, fmt),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка записи формата вывода: %s", exc)
 
     # -- Транскрипты (история) ------------------------------------------------
     def save_transcript(self, user_id: int, source: str, video_id: str,
@@ -618,34 +664,56 @@ class YTClient:
 
 
 # ---------------------------------------------------------------------------
-# Распознавание речи (faster-whisper, локально).
+# Распознавание речи (Google Speech Recognition — бесплатно, без загрузки
+# моделей; идеально для Render Free, где faster-whisper не помещается в RAM).
 # ---------------------------------------------------------------------------
 class STTClient:
-    """Локальный STT на faster-whisper (язык определяется автоматически)."""
+    """STT через Google Speech API (SpeechRecognition).
 
-    def __init__(self, model_name: str = "small"):
-        self.model_name = model_name
-        self._model = None
+    Аудио декодируется pydub/ffmpeg в WAV 16 кГц моно, режется на чанки по
+    STT_CHUNK_SECONDS и распознаётся по частям (бесплатный эндпоинт Google
+    ограничивает длину одного запроса ~1 минутой).
+    """
 
-    def _ensure_model(self):
-        if self._model is None:
-            from faster_whisper import WhisperModel  # noqa: WPS433
-            self._model = WhisperModel(
-                self.model_name, device="cpu", compute_type="int8"
-            )
-            logger.info("Whisper-модель %s загружена", self.model_name)
-        return self._model
+    def __init__(self, language: str = "ru-RU"):
+        self.language = language
 
     def transcribe_file(self, path: str) -> str:
-        """Распознаёт медиафайл (аудио/видео — faster-whisper декодирует сам)."""
-        model = self._ensure_model()
-        segments, _info = model.transcribe(path, vad_filter=True)
+        """Распознаёт медиафайл (аудио/видео) и возвращает текст."""
+        import speech_recognition as sr
+        from pydub import AudioSegment
+
+        audio = AudioSegment.from_file(path)
+        # Ограничиваем общую длительность и нормализуем формат.
+        audio = audio[: MAX_AUDIO_SECONDS * 1000]
+        audio = audio.set_channels(1).set_frame_rate(16000)
+
+        recognizer = sr.Recognizer()
+        chunk_ms = STT_CHUNK_SECONDS * 1000
         parts = []
-        for seg in segments:
-            if seg.start > MAX_AUDIO_SECONDS:
-                break
-            parts.append(seg.text.strip())
-        return " ".join(p for p in parts if p)
+        for start in range(0, len(audio), chunk_ms):
+            chunk = audio[start:start + chunk_ms]
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                chunk_path = tf.name
+            try:
+                chunk.export(chunk_path, format="wav")
+                with sr.AudioFile(chunk_path) as source:
+                    data = recognizer.record(source)
+                try:
+                    parts.append(recognizer.recognize_google(
+                        data, language=self.language
+                    ))
+                except sr.UnknownValueError:
+                    continue  # тишина/шум в этом чанке — пропускаем
+                except sr.RequestError as exc:
+                    logger.warning("Google STT RequestError: %s", exc)
+                    break
+            finally:
+                try:
+                    os.unlink(chunk_path)
+                except OSError:
+                    pass
+        return " ".join(p for p in parts if p).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +737,18 @@ class MediaBot:
     CB_DL_VIDEO = "dlv:"    # скачать видео по format_id
     CB_DL_AUDIO = "dla:"    # скачать аудио по format_id
     CB_BYPASS = "bypass:"   # меню обхода (youtube_bypass.py)
+    CB_TMPL_MENU = "tmplmenu"   # меню шаблонов (просмотр/редактирование)
+    CB_TMPL_VIEW = "tv:"        # показать текст шаблона
+    CB_TMPL_EDIT = "te:"        # начать редактирование шаблона
+    CB_TMPL_NEW = "tnew"        # начать создание своего шаблона
+    CB_TMPL_DEL = "td:"         # удалить свой шаблон
+    CB_OUT_MENU = "outmenu"     # выбрать формат вывода
+    CB_OUT_SET = "outset:"      # установить формат вывода (tg/md/both)
+
+    # Форматы вывода результата.
+    OUT_TG = "tg"      # только в чат
+    OUT_MD = "md"      # только .md файлом
+    OUT_BOTH = "both"  # и в чат, и .md
 
     def __init__(self, db: BotDatabase, llm: LLMClient, yt: YTClient, stt: STTClient):
         self.db = db
@@ -678,6 +758,7 @@ class MediaBot:
         self.user_sessions = {}
         self._busy = {}       # user_id -> идёт тяжёлая обработка
         self._last_job = {}   # user_id -> monotonic-время последнего запроса
+        self._pending_template = {}  # user_id -> ожидание ввода текста шаблона
 
     # -- Утилиты -----------------------------------------------------------
     def extract_youtube_id(self, text: str):
@@ -737,13 +818,13 @@ class MediaBot:
             "Пришлите ссылку на YouTube (или просто ID видео), голосовое, "
             "аудио- или видеофайл — я достану текст и переработаю его через ИИ "
             "по шаблону.\n\n"
-            "\U0001F4DD Шаблоны: саммари · Пирамида Минто · экшен-план · конспект "
-            "— выбор кнопками после транскрипта. Свои: /add_template\n"
-            "\U0001F527 Команды:\n"
-            "/bypass — методы обхода блокировок YouTube\n"
-            "/templates — список шаблонов, /del_template — удалить свой\n"
-            "/history — сохранённые транскрипты\n"
-            "/stats — статистика, /help — справка"
+            "\U0001F447 Внизу — постоянное меню кнопок: Шаблоны, История, "
+            "Формат вывода, Обход YouTube, Помощь. Оно всегда под рукой, "
+            "листать вверх не нужно.\n\n"
+            "\U0001F4DD Шаблоны: саммари · Пирамида Минто · экшен-план · конспект. "
+            "Тексты шаблонов можно смотреть, менять и создавать свои — "
+            "кнопка «Шаблоны».",
+            reply_markup=self.PERSISTENT_KB,
         )
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -843,10 +924,44 @@ class MediaBot:
         await self._show_history(update.effective_message, update.effective_user.id)
 
     # -- Приём текста / ссылки --------------------------------------------
+    # Подписи постоянной reply-клавиатуры → действия.
+    KB_TEMPLATES = "\U0001F4DD Шаблоны"
+    KB_HISTORY = "\U0001F559 История"
+    KB_OUTPUT = "\u2699\ufe0f Формат вывода"
+    KB_BYPASS = "\U0001F513 Обход YouTube"
+    KB_HELP = "\u2139\ufe0f Помощь"
+
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             text = (update.message.text or "").strip()
             user_id = update.effective_user.id
+
+            # 0. Кнопки постоянной reply-клавиатуры.
+            if text == self.KB_TEMPLATES:
+                await self._show_templates_menu(update, context)
+                return
+            if text == self.KB_HISTORY:
+                await self._show_history(update.effective_message, user_id)
+                return
+            if text == self.KB_OUTPUT:
+                await self._show_output_menu_msg(update, context)
+                return
+            if text == self.KB_BYPASS:
+                from youtube_bypass import show_bypass_menu
+                await show_bypass_menu(
+                    update.effective_message, self.db, user_id
+                )
+                return
+            if text == self.KB_HELP:
+                await self.help_command(update, context)
+                return
+
+            # 1. Ожидание ввода текста нового/редактируемого шаблона.
+            pending = self._pending_template.get(user_id)
+            if pending:
+                await self._finish_template_input(update, context, pending, text)
+                return
+
             video_id = self.extract_youtube_id(text)
             if video_id:
                 await self._process_youtube(update, context, video_id)
@@ -873,7 +988,8 @@ class MediaBot:
                     self._release_user(user_id)
             else:
                 await update.message.reply_text(
-                    "Пришлите ссылку на YouTube, ID видео, голосовое или аудиофайл."
+                    "Пришлите ссылку на YouTube, ID видео, голосовое или аудиофайл.",
+                    reply_markup=self.PERSISTENT_KB,
                 )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в handle_text")
@@ -881,6 +997,83 @@ class MediaBot:
                 await update.message.reply_text(f"\u26a0\ufe0f Внутренняя ошибка: {e}")
             except Exception:  # noqa: BLE001
                 pass
+
+    async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self._pending_template.pop(update.effective_user.id, None)
+        await update.message.reply_text(
+            "\u274c Отменено.", reply_markup=self.PERSISTENT_KB
+        )
+
+    async def _finish_template_input(self, update, context, pending, text):
+        """Обрабатывает присланный текст шаблона (создание/редактирование)."""
+        user_id = update.effective_user.id
+        if text.startswith("/"):  # пользователь передумал и ввёл команду
+            self._pending_template.pop(user_id, None)
+            await update.message.reply_text(
+                "Ввод шаблона отменён.", reply_markup=self.PERSISTENT_KB
+            )
+            return
+        try:
+            if pending["mode"] == "edit":
+                tid = pending["id"]
+                name = pending["name"]
+                self.db.save_template(user_id, tid, name, text.strip())
+                self._pending_template.pop(user_id, None)
+                await update.message.reply_text(
+                    f"\u2705 Шаблон «{name}» обновлён. Новый текст сохранён.",
+                    reply_markup=self.PERSISTENT_KB,
+                )
+            else:  # new
+                if "|" not in text:
+                    await update.message.reply_text(
+                        "\u26a0\ufe0f Нужен формат: Название | текст промпта\n"
+                        "Попробуйте ещё раз или /cancel."
+                    )
+                    return
+                name, prompt = [p.strip() for p in text.split("|", 1)]
+                if not name or not prompt:
+                    await update.message.reply_text(
+                        "\u26a0\ufe0f И название, и текст обязательны. /cancel для отмены."
+                    )
+                    return
+                # Генерируем свободный ID.
+                existing = self.db.get_templates(user_id)
+                idx = 1
+                while f"u{idx}" in existing:
+                    idx += 1
+                tid = f"u{idx}"
+                self.db.save_template(user_id, tid, name[:64], prompt)
+                self._pending_template.pop(user_id, None)
+                await update.message.reply_text(
+                    f"\u2705 Шаблон «{name[:64]}» создан (ID: {tid}). "
+                    "Он появился на кнопках выбора.",
+                    reply_markup=self.PERSISTENT_KB,
+                )
+        except Exception as exc:  # noqa: BLE001
+            self._pending_template.pop(user_id, None)
+            await update.message.reply_text(f"\u274c Ошибка: {exc}")
+
+    async def _show_output_menu_msg(self, update, context):
+        """Меню формата вывода, вызванное reply-кнопкой (не callback)."""
+        user_id = update.effective_user.id
+        cur = self.db.get_output_format(user_id)
+        def mark(f):
+            return "\u2705 " if f == cur else ""
+        rows = [
+            [InlineKeyboardButton(
+                f"{mark('tg')}\U0001F4AC Только в чат",
+                callback_data=f"{self.CB_OUT_SET}{self.OUT_TG}")],
+            [InlineKeyboardButton(
+                f"{mark('md')}\U0001F4C4 Только .md файлом",
+                callback_data=f"{self.CB_OUT_SET}{self.OUT_MD}")],
+            [InlineKeyboardButton(
+                f"{mark('both')}\U0001F500 В чат + .md файл",
+                callback_data=f"{self.CB_OUT_SET}{self.OUT_BOTH}")],
+        ]
+        await update.effective_message.reply_text(
+            "\u2699\ufe0f Формат вывода результата:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
 
     # -- YouTube: транскрипт → сессия → кнопки -----------------------------
     async def _process_youtube(self, update: Update, context, video_id: str):
@@ -920,12 +1113,12 @@ class MediaBot:
                     await self._safe_edit(
                         status,
                         "\U0001F3A7 Субтитры не добыты — скачиваю аудио и распознаю "
-                        f"речь (Whisper)…\nДиагностика: {exc.report[0] if exc.report else ''}",
+                        f"речь (Google)…\nДиагностика: {exc.report[0] if exc.report else ''}",
                     )
 
             if not transcript:
                 transcript = await self._transcribe_youtube_audio(status, video_id)
-                method_label = "\U0001F399 Whisper (аудио)"
+                method_label = "\U0001F399 Google (аудио)"
                 if not transcript:
                     await status.edit_text(
                         "\u274C Не удалось получить содержание видео.\n\n"
@@ -973,10 +1166,10 @@ class MediaBot:
                         client, use_cookies, timeout=YT_DOWNLOAD_TIMEOUT,
                     )
                     await self._safe_edit(
-                        status, "\U0001F399 Аудио скачано — распознаю речь (Whisper)…"
+                        status, "\U0001F399 Аудио скачано — распознаю речь (Google)…"
                     )
                     return await self._run_sync(
-                        self.stt.transcribe_file, path, timeout=WHISPER_TIMEOUT
+                        self.stt.transcribe_file, path, timeout=STT_TIMEOUT
                     )
             except (asyncio.TimeoutError, TimeoutError):
                 continue
@@ -1025,11 +1218,11 @@ class MediaBot:
                 media_path = tf.name
             try:
                 await status.edit_text(
-                    "\U0001F399 Распознаю речь (Whisper)… на длинном файле это "
-                    "может занять несколько минут."
+                    "\U0001F399 Распознаю речь (Google Speech)… на длинном файле "
+                    "это может занять до минуты."
                 )
                 text = await self._run_sync(
-                    self.stt.transcribe_file, media_path, timeout=WHISPER_TIMEOUT
+                    self.stt.transcribe_file, media_path, timeout=STT_TIMEOUT
                 )
             finally:
                 try:
@@ -1044,7 +1237,7 @@ class MediaBot:
                 return
             file_name = getattr(file_obj, "file_name", "") or kind
             transcript_id = self.db.save_transcript(
-                user_id, kind, None, file_name, text, "Whisper"
+                user_id, kind, None, file_name, text, "Google Speech"
             )
             self._set_session(
                 user_id, text, source=kind, video_id=None,
@@ -1100,6 +1293,17 @@ class MediaBot:
         return mime_map.get((mime_type or "").lower(), "")
 
     # -- Инлайн-интерфейс ---------------------------------------------------
+    PERSISTENT_KB = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("\U0001F4DD Шаблоны"), KeyboardButton("\U0001F559 История")],
+            [KeyboardButton("\u2699\ufe0f Формат вывода"), KeyboardButton("\U0001F513 Обход YouTube")],
+            [KeyboardButton("\u2139\ufe0f Помощь")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Пришлите ссылку YouTube, голосовое или аудио…",
+    )
+
     def _action_keyboard(self, user_id: int, has_video: bool) -> InlineKeyboardMarkup:
         templates = list(self.db.get_templates(user_id).items())[:12]
         rows = []
@@ -1113,10 +1317,24 @@ class MediaBot:
                 row = []
         if row:
             rows.append(row)
+        cur_fmt = self.db.get_output_format(user_id)
+        fmt_label = {
+            "tg": "в чат", "md": ".md файл", "both": "чат + .md",
+        }.get(cur_fmt, "в чат")
         rows.append(
             [
-                InlineKeyboardButton("\U0001F4C4 Полный транскрипт", callback_data=self.CB_TXT),
+                InlineKeyboardButton("\U0001F4C4 Транскрипт", callback_data=self.CB_TXT),
                 InlineKeyboardButton("\U0001F559 История", callback_data=self.CB_HIST_MENU),
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"\u2699\ufe0f Вывод: {fmt_label}", callback_data=self.CB_OUT_MENU
+                ),
+                InlineKeyboardButton(
+                    "\U0001F4DD Шаблоны", callback_data=self.CB_TMPL_MENU
+                ),
             ]
         )
         if has_video:
@@ -1168,6 +1386,175 @@ class MediaBot:
         if data.startswith(self.CB_HIST):
             await self._load_history_item(update, context, data[len(self.CB_HIST):])
             return
+        if data == self.CB_OUT_MENU:
+            await self._show_output_menu(update, context)
+            return
+        if data.startswith(self.CB_OUT_SET):
+            await self._set_output_format(update, context, data[len(self.CB_OUT_SET):])
+            return
+        if data == self.CB_TMPL_MENU:
+            await self._show_templates_menu(update, context)
+            return
+        if data.startswith(self.CB_TMPL_VIEW):
+            await self._view_template(update, context, data[len(self.CB_TMPL_VIEW):])
+            return
+        if data.startswith(self.CB_TMPL_EDIT):
+            await self._start_edit_template(update, context, data[len(self.CB_TMPL_EDIT):])
+            return
+        if data.startswith(self.CB_TMPL_DEL):
+            await self._delete_template_cb(update, context, data[len(self.CB_TMPL_DEL):])
+            return
+        if data == self.CB_TMPL_NEW:
+            await self._start_new_template(update, context)
+            return
+
+    # -- Формат вывода ------------------------------------------------------
+    async def _show_output_menu(self, update, context):
+        query = update.callback_query
+        cur = self.db.get_output_format(update.effective_user.id)
+        def mark(f):
+            return "\u2705 " if f == cur else ""
+        rows = [
+            [InlineKeyboardButton(
+                f"{mark('tg')}\U0001F4AC Только в чат",
+                callback_data=f"{self.CB_OUT_SET}{self.OUT_TG}")],
+            [InlineKeyboardButton(
+                f"{mark('md')}\U0001F4C4 Только .md файлом",
+                callback_data=f"{self.CB_OUT_SET}{self.OUT_MD}")],
+            [InlineKeyboardButton(
+                f"{mark('both')}\U0001F500 В чат + .md файл",
+                callback_data=f"{self.CB_OUT_SET}{self.OUT_BOTH}")],
+        ]
+        await self._safe_edit(
+            query.message,
+            "\u2699\ufe0f Как выводить результат обработки?\n\n"
+            "\U0001F4AC в чат — быстро, видно сразу\n"
+            "\U0001F4C4 .md — удобно сохранить в Obsidian/заметки\n"
+            "\U0001F500 оба варианта",
+        )
+        try:
+            await query.message.edit_reply_markup(InlineKeyboardMarkup(rows))
+        except Exception:  # noqa: BLE001
+            await query.message.reply_text(
+                "Выберите формат:", reply_markup=InlineKeyboardMarkup(rows)
+            )
+
+    async def _set_output_format(self, update, context, fmt: str):
+        if fmt not in (self.OUT_TG, self.OUT_MD, self.OUT_BOTH):
+            return
+        self.db.set_output_format(update.effective_user.id, fmt)
+        label = {"tg": "только в чат", "md": "только .md файлом",
+                 "both": "в чат + .md файл"}[fmt]
+        await self._safe_edit(
+            update.callback_query.message,
+            f"\u2705 Формат вывода: {label}.\nТеперь выберите шаблон обработки.",
+        )
+
+    # -- Меню шаблонов (просмотр текста, создание, редактирование) ----------
+    async def _show_templates_menu(self, update, context):
+        query = update.callback_query
+        user_id = update.effective_user.id
+        templates = self.db.get_templates(user_id)
+        rows = []
+        for tid, t in templates.items():
+            rows.append([
+                InlineKeyboardButton(
+                    f"\U0001F441 {t['name']}", callback_data=f"{self.CB_TMPL_VIEW}{tid}"
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                "\u2795 Создать свой шаблон", callback_data=self.CB_TMPL_NEW
+            )
+        ])
+        text = (
+            "\U0001F4DD Шаблоны обработки\n\n"
+            "Нажмите на шаблон, чтобы увидеть его текст (промпт), "
+            "изменить или удалить. Стандартные можно переопределить своим "
+            "текстом — они помечаются как изменённые."
+        )
+        if query:
+            await self._safe_edit(query.message, text)
+            try:
+                await query.message.edit_reply_markup(InlineKeyboardMarkup(rows))
+            except Exception:  # noqa: BLE001
+                await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        else:
+            await update.effective_message.reply_text(
+                text, reply_markup=InlineKeyboardMarkup(rows)
+            )
+
+    async def _view_template(self, update, context, tid: str):
+        query = update.callback_query
+        user_id = update.effective_user.id
+        t = self.db.get_templates(user_id).get(tid)
+        if not t:
+            await self._safe_edit(query.message, "\u26a0\ufe0f Шаблон не найден.")
+            return
+        is_default = tid in DEFAULT_TEMPLATES
+        rows = [
+            [InlineKeyboardButton(
+                "\u270f\ufe0f Изменить текст", callback_data=f"{self.CB_TMPL_EDIT}{tid}"
+            )],
+        ]
+        if not is_default:
+            rows.append([InlineKeyboardButton(
+                "\U0001F5d1 Удалить", callback_data=f"{self.CB_TMPL_DEL}{tid}"
+            )])
+        rows.append([InlineKeyboardButton(
+            "\u2b05\ufe0f К списку шаблонов", callback_data=self.CB_TMPL_MENU
+        )])
+        note = " (стандартный)" if is_default else " (ваш)"
+        await self._safe_edit(
+            query.message,
+            f"\U0001F4DD {t['name']}{note}\nID: {tid}\n\n"
+            f"\U0001F4C4 Текст промпта:\n\u2014\u2014\u2014\n{t['prompt']}\n\u2014\u2014\u2014\n\n"
+            "Изменить — кнопка ниже. Также командой:\n"
+            f"/add_template {tid} | {t['name']} | новый текст",
+        )
+        try:
+            await query.message.edit_reply_markup(InlineKeyboardMarkup(rows))
+        except Exception:  # noqa: BLE001
+            await query.message.reply_text("Действия:", reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _start_edit_template(self, update, context, tid: str):
+        user_id = update.effective_user.id
+        t = self.db.get_templates(user_id).get(tid)
+        if not t:
+            return
+        # Запоминаем режим ожидания нового текста для этого шаблона.
+        self._pending_template[user_id] = {"mode": "edit", "id": tid, "name": t["name"]}
+        await self._safe_edit(
+            update.callback_query.message,
+            f"\u270f\ufe0f Редактирование «{t['name']}» (ID: {tid}).\n\n"
+            "Пришлите СЛЕДУЮЩИМ сообщением новый текст промпта — "
+            "инструкцию для ИИ, как обрабатывать текст.\n\n"
+            "Отмена: /cancel",
+        )
+
+    async def _start_new_template(self, update, context):
+        user_id = update.effective_user.id
+        self._pending_template[user_id] = {"mode": "new", "step": "id"}
+        await self._safe_edit(
+            update.callback_query.message,
+            "\u2795 Новый шаблон.\n\n"
+            "Пришлите одним сообщением в формате:\n"
+            "Название | текст промпта\n\n"
+            "Например:\n"
+            "Перевод на английский | Переведи текст на английский, сохрани смысл.\n\n"
+            "Отмена: /cancel",
+        )
+
+    async def _delete_template_cb(self, update, context, tid: str):
+        user_id = update.effective_user.id
+        if tid in DEFAULT_TEMPLATES:
+            await self._safe_edit(
+                update.callback_query.message,
+                "Стандартный шаблон удалить нельзя (можно переопределить текст).",
+            )
+            return
+        self.db.delete_template(user_id, tid)
+        await self._show_templates_menu(update, context)
 
     async def _process_template(self, update, context, template_id: str):
         query = update.callback_query
@@ -1189,13 +1576,63 @@ class MediaBot:
             )
             result = await self.llm.complete(template["prompt"], session["text"])
             session["chat_history"] = [{"role": "assistant", "content": result}]
-            await self._send_long(query.message, result)
+            await self._deliver_result(
+                update, context, result, template["name"], session,
+            )
             await query.message.reply_text(
                 "\U0001F4AC Можно задать вопрос по этому тексту — просто напишите."
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("Ошибка в _process_template")
             await self._safe_edit(query.message, f"\u26a0\ufe0f Внутренняя ошибка: {e}")
+
+    async def _deliver_result(self, update, context, result, template_name, session):
+        """Выдаёт результат согласно выбранному формату вывода (tg/md/both)."""
+        user_id = update.effective_user.id
+        out_fmt = self.db.get_output_format(user_id)
+        message = update.effective_message
+        # В чат.
+        if out_fmt in (self.OUT_TG, self.OUT_BOTH):
+            await self._send_long(message, result)
+        # .md файлом.
+        if out_fmt in (self.OUT_MD, self.OUT_BOTH):
+            title = session.get("title") or "результат"
+            md = self._build_markdown(result, template_name, session)
+            base = re.sub(r"[^\w\s.-]", "", title).strip()[:50] or "result"
+            base = base.replace(" ", "_")
+            tmp_path = os.path.join(tempfile.gettempdir(), f"{base}_{template_name[:20]}.md")
+            tmp_path = re.sub(r"[^\w./-]", "_", tmp_path)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(md)
+            try:
+                with open(tmp_path, "rb") as fh:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=fh,
+                        filename=os.path.basename(tmp_path),
+                        caption=f"\U0001F4C4 {template_name} · Markdown",
+                    )
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _build_markdown(result, template_name, session) -> str:
+        """Собирает аккуратный .md: заголовок, источник, метаданные, результат."""
+        from datetime import datetime
+        title = session.get("title") or "Без названия"
+        source = session.get("source") or ""
+        video_id = session.get("video_id")
+        lines = [f"# {title}", ""]
+        meta = [f"- **Обработка:** {template_name}"]
+        meta.append(f"- **Источник:** {source}")
+        if video_id:
+            meta.append(f"- **YouTube:** https://youtu.be/{video_id}")
+        meta.append(f"- **Дата:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines += meta + ["", "---", "", result, ""]
+        return "\n".join(lines)
 
     async def _send_transcript_file(self, update, context):
         query = update.callback_query
@@ -1408,11 +1845,12 @@ async def _post_init(app):
         await app.bot.set_my_commands(
             [
                 BotCommand("start", "Запуск и справка"),
+                BotCommand("templates", "Шаблоны: смотреть/менять/создавать"),
+                BotCommand("history", "Сохранённые транскрипты"),
                 BotCommand("bypass", "Методы обхода YouTube"),
-                BotCommand("templates", "Мои шаблоны"),
                 BotCommand("add_template", "Добавить шаблон"),
                 BotCommand("del_template", "Удалить шаблон"),
-                BotCommand("history", "Сохранённые транскрипты"),
+                BotCommand("cancel", "Отменить ввод"),
                 BotCommand("stats", "Статистика"),
                 BotCommand("help", "Помощь"),
             ]
@@ -1431,7 +1869,7 @@ def main() -> None:
     db = BotDatabase(DB_PATH)
     llm = LLMClient(AI_API_KEY, AI_API_URL, AI_MODEL)
     yt = YTClient()
-    stt = STTClient(WHISPER_MODEL)
+    stt = STTClient(STT_LANGUAGE)
     bot = MediaBot(db, llm, yt, stt)
 
     app = (
@@ -1449,6 +1887,7 @@ def main() -> None:
     app.add_handler(CommandHandler("del_template", bot.del_template_command))
     app.add_handler(CommandHandler("stats", bot.stats_command))
     app.add_handler(CommandHandler("history", bot.history_command))
+    app.add_handler(CommandHandler("cancel", bot.cancel_command))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text)
     )
