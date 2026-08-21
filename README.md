@@ -61,7 +61,7 @@
 | Переменная | Назначение | По умолчанию |
 |------------|-----------|--------------|
 | `TELEGRAM_BOT_TOKEN` | Токен бота | — |
-| `AI_API_KEY` / `AI_API_URL` / `AI_MODEL` | LLM (OpenRouter) | openrouter / gpt-4o-mini |
+| `AI_API_KEY` / `AI_API_URL` / `AI_MODEL` | LLM (OpenRouter) | openrouter / gemini-2.0-flash-exp:free |
 | `WHISPER_MODEL` | Модель faster-whisper | `small` |
 | `YT_COOKIES` | **Содержимое** cookies.txt в env (для Render) | — |
 | `YT_COOKIES_FILE` | Путь к файлу куки | — |

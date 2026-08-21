@@ -32,7 +32,7 @@
    - `AI_PROVIDER` = `openai`
    - `AI_API_URL` = `https://openrouter.ai/api/v1`
    - `AI_API_KEY` = `sk-or-v1-...` (OpenRouter)
-   - `AI_MODEL` = `openai/gpt-4o-mini` (или любая другая)
+   - `AI_MODEL` = `google/gemini-2.0-flash-exp:free` (бесплатная через OpenRouter)
    - `DB_PATH` = `/var/data/bot_database.db`
    - `YT_COOKIES_FILE` (опц.) = `/var/data/cookies.txt` — см. ниже про bot-check
 5. **Deploy** и следи за логами.

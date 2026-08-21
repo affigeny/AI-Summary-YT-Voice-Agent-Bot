@@ -20,7 +20,7 @@ services:
       - key: AI_API_URL
         value: https://openrouter.ai/api/v1
       - key: AI_MODEL
-        value: openai/gpt-4o-mini
+        value: google/gemini-2.0-flash-exp:free
       - key: DB_PATH
         value: /var/data/bot_database.db
       # AI_API_KEY задаётся вручную (секрет, не хранить в репозитории)
