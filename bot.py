@@ -59,10 +59,12 @@ from telegram.ext import (
     filters,
 )
 
+import ai_providers
 import yt_transcript
+from ai_providers import register_ai_command, show_ai_menu
 from youtube_bypass import handle_bypass_callback, register_bypass_command
 
-__version__ = "6.1.0"
+__version__ = "6.2.0"
 VERSION_STRING = __version__
 
 # ---------------------------------------------------------------------------
@@ -222,11 +224,19 @@ class BotDatabase:
             )
             """
         )
-        # Миграция: добавить output_format, если таблица была создана ранее.
-        try:
-            cur.execute("ALTER TABLE user_settings ADD COLUMN output_format TEXT DEFAULT 'tg'")
-        except sqlite3.OperationalError:
-            pass  # колонка уже есть
+        # Миграции: добавляем колонки, если таблица создана более старой версией.
+        for ddl in (
+            "ALTER TABLE user_settings ADD COLUMN output_format TEXT DEFAULT 'tg'",
+            "ALTER TABLE user_settings ADD COLUMN ai_provider TEXT DEFAULT 'auto'",
+            "ALTER TABLE user_settings ADD COLUMN ai_auto INTEGER DEFAULT 1",
+            "ALTER TABLE user_settings ADD COLUMN ai_api_url TEXT",
+            "ALTER TABLE user_settings ADD COLUMN ai_api_key TEXT",
+            "ALTER TABLE user_settings ADD COLUMN ai_model TEXT",
+        ):
+            try:
+                cur.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
         conn.commit()
         conn.close()
 
@@ -312,6 +322,56 @@ class BotDatabase:
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка записи настроек: %s", exc)
 
+    # -- Настройки ИИ (провайдер, авто-перебор, свои ключи) ------------------
+    AI_FIELDS = ("ai_provider", "ai_auto", "ai_api_url", "ai_api_key", "ai_model")
+
+    def get_ai_settings(self, user_id: int) -> dict:
+        """Настройки ИИ пользователя; при отсутствии — значения по умолчанию."""
+        defaults = {
+            "ai_provider": "auto", "ai_auto": 1,
+            "ai_api_url": None, "ai_api_key": None, "ai_model": None,
+        }
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                f"SELECT {', '.join(self.AI_FIELDS)} FROM user_settings "
+                "WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            conn.close()
+            if not row:
+                return defaults
+            data = dict(zip(self.AI_FIELDS, row))
+            if data.get("ai_provider") is None:
+                data["ai_provider"] = "auto"
+            if data.get("ai_auto") is None:
+                data["ai_auto"] = 1
+            return data
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка чтения настроек ИИ: %s", exc)
+            return defaults
+
+    def set_ai_setting(self, user_id: int, field: str, value):
+        if field not in self.AI_FIELDS:
+            raise ValueError(f"неизвестное поле {field}")
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                INSERT INTO user_settings (user_id, {field})
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET {field} = excluded.{field}
+                """,
+                (user_id, value),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка записи настроек ИИ: %s", exc)
+
     def get_output_format(self, user_id: int) -> str:
         try:
             conn = self._conn()
@@ -389,6 +449,20 @@ class BotDatabase:
         except Exception as exc:  # noqa: BLE001
             logger.error("Ошибка чтения истории: %s", exc)
             return []
+
+    def update_transcript_title(self, transcript_id: int, user_id: int, title: str):
+        """Дописывает название задним числом (когда его добыли позже)."""
+        try:
+            conn = self._conn()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE transcripts SET title = ? WHERE id = ? AND user_id = ?",
+                (title, transcript_id, user_id),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Ошибка обновления названия: %s", exc)
 
     def get_transcript_by_id(self, transcript_id: int, user_id: int):
         try:
@@ -503,13 +577,51 @@ class LLMClient:
             cleaned.insert(1, {"role": "user", "content": "Продолжай."})
         return cleaned
 
-    async def complete(self, prompt: str, context_text: str, history=None, retries=2):
-        if not self.api_key:
+    async def complete(self, prompt: str, context_text: str, history=None,
+                       retries=2, chain=None):
+        """Запрос к LLM. chain — список провайдеров для авто-перебора.
+
+        chain: [{name, url, key, model}, …]. Если не передан — используются
+        креды по умолчанию (из переменных окружения).
+        """
+        candidates = chain or [{
+            "name": "env", "url": self.api_url,
+            "key": self.api_key, "model": self.model,
+        }]
+        candidates = [c for c in candidates if c.get("key") and c.get("url")]
+        if not candidates:
             return (
-                "\u26a0\ufe0f API-ключ нейросети не настроен. "
-                "Задайте AI_API_KEY в настройках сервиса."
+                "\u26a0\ufe0f Нет доступного ИИ: не задан ни один API-ключ.\n"
+                "Откройте «\U0001F9E0 Нейросеть» и добавьте ключ, либо задайте "
+                "AI_API_KEY в настройках сервиса."
             )
 
+        messages = self._build_messages(prompt, context_text, history)
+        errors = []
+        for idx, creds in enumerate(candidates):
+            result, reason = await self._try_provider(creds, messages, retries)
+            if result is not None:
+                if idx > 0:
+                    # Сообщаем, что сработал не первый провайдер — иначе
+                    # пользователь не поймёт, почему стиль ответа изменился.
+                    result = (
+                        f"\u2139\ufe0f Ответ получен через {creds['name']} "
+                        f"({creds['model']}) — предыдущие были недоступны.\n\n"
+                        + result
+                    )
+                return result
+            errors.append(f"• {creds['name']}: {reason}")
+
+        detail = "\n".join(errors[:5])
+        return (
+            "\u26a0\ufe0f Ни один ИИ не ответил.\n\n"
+            f"{detail}\n\n"
+            "Нажмите «\u267b\ufe0f Повторить» или откройте «\U0001F9E0 Нейросеть», "
+            "чтобы выбрать другого провайдера."
+        )
+
+    def _build_messages(self, prompt: str, context_text: str, history=None) -> list:
+        """Собирает и санитизирует messages для OpenAI-совместимого API."""
         messages = [
             {
                 "role": "system",
@@ -541,27 +653,31 @@ class LLMClient:
             messages.extend(trimmed)
         if prompt:
             messages.append({"role": "user", "content": prompt})
+        return self._sanitize(messages)
 
-        messages = self._sanitize(messages)
-        payload = {"model": self.model, "messages": messages, "temperature": 0.5}
+    async def _try_provider(self, creds: dict, messages: list, retries: int):
+        """Один провайдер с ретраями. Возвращает (текст|None, причина)."""
+        payload = {
+            "model": creds["model"],
+            "messages": messages,
+            "temperature": 0.5,
+        }
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {creds['key']}",
         }
         timeout = aiohttp.ClientTimeout(total=LLM_TIMEOUT)
+        url = f"{creds['url'].rstrip('/')}/chat/completions"
 
         last_reason = ""
         for attempt in range(retries + 1):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        f"{self.api_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                        timeout=timeout,
+                        url, headers=headers, json=payload, timeout=timeout,
                     ) as resp:
                         if resp.status == 200:
-                            data = await resp.json()
+                            data = await resp.json(content_type=None)
                             choices = data.get("choices") or []
                             if not choices:
                                 last_reason = "пустой ответ модели"
@@ -574,40 +690,44 @@ class LLMClient:
                                 last_reason = "модель вернула пустой текст"
                                 await asyncio.sleep((attempt + 1) * 2)
                                 continue
-                            return content
+                            return content, ""
                         body = (await resp.text())[:300]
-                        logger.warning("LLM HTTP %s: %s", resp.status, body)
+                        logger.warning(
+                            "LLM %s HTTP %s: %s", creds["name"], resp.status, body
+                        )
                         last_reason = self._explain_http(resp.status, body)
+                        # 4xx (кроме 429) не лечится ретраем — сразу к следующему.
                         if resp.status not in (429, 500, 502, 503, 504):
-                            return f"\u26a0\ufe0f {last_reason}"
+                            return None, last_reason
                         await asyncio.sleep((attempt + 1) * 2)
             except asyncio.TimeoutError:
-                last_reason = f"модель не ответила за {LLM_TIMEOUT} с"
-                logger.warning("LLM timeout")
+                last_reason = f"нет ответа за {LLM_TIMEOUT} с"
+                logger.warning("LLM %s timeout", creds["name"])
                 await asyncio.sleep((attempt + 1) * 2)
             except Exception as exc:  # noqa: BLE001
                 last_reason = f"сетевая ошибка: {str(exc)[:80]}"
-                logger.warning("LLM error: %s", exc)
+                logger.warning("LLM %s error: %s", creds["name"], exc)
                 await asyncio.sleep((attempt + 1) * 2)
-
-        return (
-            f"\u26a0\ufe0f Не удалось получить ответ ИИ ({last_reason or 'причина неизвестна'}).\n"
-            "Нажмите «\u267b\ufe0f Повторить» — часто помогает со второго раза."
-        )
+        return None, last_reason or "причина неизвестна"
 
     @staticmethod
     def _explain_http(status: int, body: str) -> str:
-        """Человеческое объяснение ошибки вместо сухого HTTP-кода."""
-        low = body.lower()
+        """Человеческое объяснение ошибки вместо сухого HTTP-кода.
+
+        Про конкретную переменную окружения здесь не пишем: провайдер может
+        быть выбран в меню «🧠 Нейросеть» со своим ключом, и совет «проверьте
+        AI_API_KEY» отправил бы пользователя не туда.
+        """
+        low = (body or "").lower()
         if status == 400 and ("token" in low or "too long" in low or "exceed" in low):
             return (
-                "текст слишком длинный для модели. Уменьшите LLM_MAX_CHARS "
-                "или начните новое обсуждение (кнопка «Другой шаблон»)"
+                "текст слишком длинный для модели — начните новое обсуждение "
+                "(кнопка «Другой шаблон») или выберите модель с большим контекстом"
             )
         if status in (401, 403):
-            return "ключ AI_API_KEY отклонён провайдером — проверьте ключ и модель"
+            return "ключ отклонён провайдером — проверьте ключ в «Нейросеть»"
         if status == 404:
-            return f"модель {'не найдена'} — проверьте AI_MODEL и AI_API_URL"
+            return "модель или эндпоинт не найдены — проверьте URL и модель"
         if status == 429:
             return "превышен лимит запросов провайдера — подождите минуту"
         if status == 400:
@@ -819,6 +939,8 @@ class MediaBot:
     CB_OUT_MENU = "outmenu"     # выбрать формат вывода
     CB_OUT_SET = "outset:"      # установить формат вывода (tg/md/both)
     CB_MENU = "menu"            # вернуть главное меню действий
+    CB_AI_MENU = "aimenu"       # меню выбора нейросети
+    CB_AI = "ai:"               # колбэки настроек ИИ
     CB_RETRY = "retry"          # повторить последний шаблон
     CB_DISCUSS = "disc:"        # выбрать, что обсуждать (transcript|result)
 
@@ -836,6 +958,7 @@ class MediaBot:
         self._busy = {}       # user_id -> идёт тяжёлая обработка
         self._last_job = {}   # user_id -> monotonic-время последнего запроса
         self._pending_template = {}  # user_id -> ожидание ввода текста шаблона
+        self._pending_ai = {}        # user_id -> ожидание ввода url/key/model
 
     # -- Утилиты -----------------------------------------------------------
     def extract_youtube_id(self, text: str):
@@ -847,6 +970,28 @@ class MediaBot:
         if self.BARE_ID_RE.match(stripped):
             return stripped
         return None
+
+    def _llm_chain(self, user_id: int) -> list:
+        """Цепочка провайдеров ИИ для пользователя.
+
+        Авто-перебор включён → полная цепочка; выключен → только выбранный.
+        """
+        settings = self.db.get_ai_settings(user_id)
+        creds = ai_providers.resolve(settings, self.llm.api_url, self.llm.model)
+        if not settings.get("ai_auto", 1):
+            return [creds]
+        chain = ai_providers.build_chain(
+            settings, self.llm.api_url, self.llm.model
+        )
+        # Выбранный провайдер всегда первый, дубли убираем.
+        result, seen = [], set()
+        for item in [creds] + chain:
+            fingerprint = (item.get("url"), item.get("model"))
+            if not item.get("key") or not item.get("url") or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            result.append(item)
+        return result
 
     def _set_session(self, user_id, text, source="youtube", video_id=None,
                      title="", transcript_id=None):
@@ -915,6 +1060,9 @@ class MediaBot:
             "3. После результата меню не исчезает: можно повторить обработку, "
             "выбрать другой шаблон или задать вопрос текстом.\n\n"
             "\u2699\ufe0f Меню обработки — кнопка внизу, открывает шаблоны в любой момент.\n\n"
+            "\U0001F9E0 Нейросеть\n"
+            "Кнопка «\U0001F9E0 Нейросеть» (или /ai) — выбор ИИ из бесплатных, "
+            "авто-перебор при отказе, свои URL/ключ/модель, тест и список моделей.\n\n"
             "\U0001F4AC Обсуждение\n"
             "После обработки вопросы по умолчанию идут по РЕЗУЛЬТАТУ ИИ. "
             "Кнопкой «Обсуждаем: …» можно переключиться на исходный транскрипт. "
@@ -1019,6 +1167,7 @@ class MediaBot:
     KB_OUTPUT = "\u2699\ufe0f Формат вывода"
     KB_BYPASS = "\U0001F513 Обход YouTube"
     KB_MENU = "\u2699\ufe0f Меню обработки"
+    KB_AI = "\U0001F9E0 Нейросеть"
     KB_HELP = "\u2139\ufe0f Помощь"
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1049,6 +1198,12 @@ class MediaBot:
             if text == self.KB_OUTPUT:
                 await self._show_output_menu_msg(update, context)
                 return
+            if text == self.KB_AI:
+                await show_ai_menu(
+                    update.effective_message, self.db, user_id,
+                    self.llm.api_url, self.llm.model,
+                )
+                return
             if text == self.KB_BYPASS:
                 from youtube_bypass import show_bypass_menu
                 await show_bypass_menu(
@@ -1063,6 +1218,12 @@ class MediaBot:
             pending = self._pending_template.get(user_id)
             if pending:
                 await self._finish_template_input(update, context, pending, text)
+                return
+
+            # 1b. Ожидание ввода настроек ИИ (URL / ключ / модель).
+            pending_ai = self._pending_ai.pop(user_id, None)
+            if pending_ai:
+                await self._finish_ai_input(update, context, pending_ai, text)
                 return
 
             video_id = self.extract_youtube_id(text)
@@ -1091,7 +1252,10 @@ class MediaBot:
 
                     history = list(session.get("chat_history") or [])
                     history.append({"role": "user", "content": text})
-                    reply = await self.llm.complete("", base_context, history)
+                    reply = await self.llm.complete(
+                        "", base_context, history,
+                        chain=self._llm_chain(user_id),
+                    )
                     if reply.startswith(LLM_ERROR_PREFIX):
                         # Историю не портим неудачным ответом, даём кнопки.
                         await self._safe_edit(status, reply)
@@ -1116,6 +1280,7 @@ class MediaBot:
 
     async def cancel_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         self._pending_template.pop(update.effective_user.id, None)
+        self._pending_ai.pop(update.effective_user.id, None)
         await update.message.reply_text(
             "\u274c Отменено.", reply_markup=self.PERSISTENT_KB
         )
@@ -1323,11 +1488,39 @@ class MediaBot:
         return ""
 
     async def _fetch_title_safe(self, video_id: str) -> str:
+        """Название видео: сначала лёгкий oEmbed, затем yt-dlp.
+
+        oEmbed отдаёт заголовок без авторизации и почти никогда не блокируется,
+        поэтому в истории и .md названия появляются даже когда yt-dlp упирается
+        в bot-check.
+        """
+        title = await self._fetch_title_oembed(video_id)
+        if title:
+            return title
         try:
             info = await self._run_sync(
                 self.yt.extract_info, video_id, timeout=45
             )
-            return info.get("title", "")
+            return (info.get("title") or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    async def _fetch_title_oembed(video_id: str) -> str:
+        """Заголовок через публичный oEmbed YouTube (без ключей и куки)."""
+        url = (
+            "https://www.youtube.com/oembed?format=json&url="
+            f"https://www.youtube.com/watch?v={video_id}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        return ""
+                    data = await resp.json(content_type=None)
+            return (data.get("title") or "").strip()
         except Exception:  # noqa: BLE001
             return ""
 
@@ -1438,8 +1631,8 @@ class MediaBot:
         [
             [KeyboardButton("\u2699\ufe0f Меню обработки")],
             [KeyboardButton("\U0001F4DD Шаблоны"), KeyboardButton("\U0001F559 История")],
-            [KeyboardButton("\u2699\ufe0f Формат вывода"), KeyboardButton("\U0001F513 Обход YouTube")],
-            [KeyboardButton("\u2139\ufe0f Помощь")],
+            [KeyboardButton("\U0001F9E0 Нейросеть"), KeyboardButton("\u2699\ufe0f Формат вывода")],
+            [KeyboardButton("\U0001F513 Обход YouTube"), KeyboardButton("\u2139\ufe0f Помощь")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1487,7 +1680,244 @@ class MediaBot:
                     )
                 ]
             )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "\U0001F9E0 Нейросеть", callback_data=self.CB_AI_MENU
+                )
+            ]
+        )
         return InlineKeyboardMarkup(rows)
+
+    # -- Настройки ИИ: колбэки, тест, модели, ручной ввод --------------------
+    AI_ASK_LABELS = {
+        "url": (
+            "\U0001F517 Пришлите базовый URL API (без /chat/completions).\n\n"
+            "Примеры:\n"
+            "• https://api.groq.com/openai/v1\n"
+            "• https://openrouter.ai/api/v1\n"
+            "• http://localhost:11434/v1 (Ollama)\n\n"
+            "/cancel — отмена."
+        ),
+        "key": (
+            "\U0001F511 Пришлите API-ключ.\n\n"
+            "Сообщение с ключом будет удалено сразу после сохранения, "
+            "в чате ключ показывается только усечённым.\n\n"
+            "/cancel — отмена."
+        ),
+        "model": (
+            "\U0001F9E9 Пришлите название модели.\n\n"
+            "Например: llama-3.3-70b-versatile, gemini-3.6-flash, "
+            "meta-llama/llama-3.3-70b-instruct:free\n\n"
+            "Список доступных можно получить кнопкой «\U0001F4E5 Модели».\n\n"
+            "/cancel — отмена."
+        ),
+    }
+    AI_ASK_FIELDS = {"url": "ai_api_url", "key": "ai_api_key", "model": "ai_model"}
+
+    async def _handle_ai_callback(self, update, context, action: str):
+        query = update.callback_query
+        user_id = update.effective_user.id
+
+        if action.startswith("set:"):
+            name = action[4:]
+            if name != "auto" and name not in ai_providers.CATALOG:
+                return
+            self.db.set_ai_setting(user_id, "ai_provider", name)
+            await show_ai_menu(
+                query.message, self.db, user_id,
+                self.llm.api_url, self.llm.model, edit=True,
+            )
+            if name == "custom":
+                await query.message.reply_text(
+                    "\U0001F527 Свой API выбран. Задайте URL, ключ и модель "
+                    "кнопками ниже, затем нажмите «\U0001F9EA Тест»."
+                )
+            elif not ai_providers.provider_key(name):
+                spec = ai_providers.CATALOG[name]
+                await query.message.reply_text(
+                    f"\U0001F511 Для {spec['label']} нужен ключ.\n\n"
+                    f"{spec['note']}\n\n"
+                    "Добавьте его кнопкой «\U0001F511 Ключ» или задайте "
+                    f"переменную окружения {spec['env']} в настройках сервиса."
+                )
+            return
+
+        if action == "toggle_auto":
+            settings = self.db.get_ai_settings(user_id)
+            new_val = 0 if settings.get("ai_auto", 1) else 1
+            self.db.set_ai_setting(user_id, "ai_auto", new_val)
+            await show_ai_menu(
+                query.message, self.db, user_id,
+                self.llm.api_url, self.llm.model, edit=True,
+            )
+            return
+
+        if action == "reset":
+            for field in ("ai_api_url", "ai_api_key", "ai_model"):
+                self.db.set_ai_setting(user_id, field, None)
+            self.db.set_ai_setting(user_id, "ai_provider", "auto")
+            self.db.set_ai_setting(user_id, "ai_auto", 1)
+            await show_ai_menu(
+                query.message, self.db, user_id,
+                self.llm.api_url, self.llm.model, edit=True,
+            )
+            await query.message.reply_text(
+                "\u267b\ufe0f Настройки ИИ сброшены: авто-выбор, ключи из "
+                "переменных окружения."
+            )
+            return
+
+        if action.startswith("ask:"):
+            what = action[4:]
+            if what not in self.AI_ASK_FIELDS:
+                return
+            self._pending_ai[user_id] = what
+            await query.message.reply_text(self.AI_ASK_LABELS[what])
+            return
+
+        if action == "test":
+            await self._test_ai_provider(update, context)
+            return
+
+        if action == "models":
+            await self._fetch_ai_models(update, context)
+            return
+
+        if action.startswith("model:"):
+            model = action[6:]
+            self.db.set_ai_setting(user_id, "ai_model", model)
+            await show_ai_menu(
+                query.message, self.db, user_id,
+                self.llm.api_url, self.llm.model, edit=True,
+            )
+            await query.message.reply_text(f"\u2705 Модель: {model}")
+            return
+
+    async def _test_ai_provider(self, update, context):
+        query = update.callback_query
+        user_id = update.effective_user.id
+        settings = self.db.get_ai_settings(user_id)
+        auto = bool(settings.get("ai_auto", 1))
+
+        if auto:
+            chain = self._llm_chain(user_id)
+            if not chain:
+                await query.message.reply_text(
+                    "\u26a0\ufe0f Нет ни одного провайдера с ключом. "
+                    "Добавьте ключ кнопкой «\U0001F511 Ключ»."
+                )
+                return
+            status = await query.message.reply_text(
+                f"\U0001F9EA Проверяю цепочку ({len(chain)})…"
+            )
+            lines = []
+            for creds in chain[:6]:
+                ok, detail = await ai_providers.test_provider(creds)
+                icon = "\u2705" if ok else "\u274C"
+                lines.append(f"{icon} {creds['name']} · {creds['model']}\n   {detail}")
+            await self._safe_edit(
+                status, "\U0001F9EA Результат теста\n\n" + "\n\n".join(lines)
+            )
+            return
+
+        creds = ai_providers.resolve(settings, self.llm.api_url, self.llm.model)
+        status = await query.message.reply_text(
+            f"\U0001F9EA Проверяю {creds['name']} · {creds['model']}…"
+        )
+        ok, detail = await ai_providers.test_provider(creds)
+        icon = "\u2705 Работает" if ok else "\u274C Не работает"
+        await self._safe_edit(
+            status,
+            f"{icon}\n\nПровайдер: {creds['name']}\n"
+            f"Модель: {creds['model']}\nURL: {creds['url']}\n\n{detail}",
+        )
+
+    async def _fetch_ai_models(self, update, context):
+        query = update.callback_query
+        user_id = update.effective_user.id
+        settings = self.db.get_ai_settings(user_id)
+        creds = ai_providers.resolve(settings, self.llm.api_url, self.llm.model)
+        status = await query.message.reply_text(
+            f"\U0001F4E5 Запрашиваю список моделей у {creds['name']}…"
+        )
+        models, err = await ai_providers.fetch_models(creds)
+        if err:
+            await self._safe_edit(
+                status,
+                f"\u274C Не удалось получить список: {err}\n\n"
+                "Модель можно задать вручную кнопкой «\U0001F9E9 Модель».",
+            )
+            return
+        if not models:
+            await self._safe_edit(status, "\u26a0\ufe0f Провайдер вернул пустой список.")
+            return
+
+        # Бесплатные и компактные модели — вперёд: их обычно и хотят.
+        def rank(mid: str):
+            low = mid.lower()
+            return (
+                0 if ":free" in low or "-free" in low else 1,
+                0 if any(s in low for s in ("flash", "mini", "small", "8b", "7b")) else 1,
+                low,
+            )
+
+        top = sorted(models, key=rank)[:12]
+        rows = [
+            [InlineKeyboardButton(m[:60], callback_data=f"{self.CB_AI}model:{m}"[:64])]
+            for m in top
+        ]
+        await self._safe_edit(
+            status,
+            f"\U0001F4E5 Доступно моделей: {len(models)}. "
+            f"Показаны {len(top)} — нажмите, чтобы выбрать.\n\n"
+            "Остальные можно задать вручную кнопкой «\U0001F9E9 Модель».",
+        )
+        await query.message.reply_text(
+            "\U0001F9E9 Выберите модель:", reply_markup=InlineKeyboardMarkup(rows)
+        )
+
+    async def _finish_ai_input(self, update, context, what: str, text: str):
+        """Сохраняет введённые вручную URL / ключ / модель."""
+        user_id = update.effective_user.id
+        field = self.AI_ASK_FIELDS[what]
+        value = text.strip()
+
+        if what == "url":
+            if not value.startswith(("http://", "https://")):
+                await update.message.reply_text(
+                    "\u26a0\ufe0f URL должен начинаться с http:// или https://. "
+                    "Попробуйте снова или /cancel."
+                )
+                self._pending_ai[user_id] = what  # остаёмся в режиме ввода
+                return
+            value = value.rstrip("/")
+            # Частая ошибка: вставляют полный путь до /chat/completions.
+            for tail in ("/chat/completions", "/chat"):
+                if value.endswith(tail):
+                    value = value[: -len(tail)]
+
+        self.db.set_ai_setting(user_id, field, value)
+        # Свои креды имеют смысл только с провайдером custom, если URL задан.
+        if what == "url":
+            self.db.set_ai_setting(user_id, "ai_provider", "custom")
+
+        if what == "key":
+            # Ключ из чата удаляем: он не должен оставаться в истории.
+            try:
+                await update.message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            await update.effective_chat.send_message(
+                "\u2705 Ключ сохранён (сообщение с ключом удалено)."
+            )
+        else:
+            await update.message.reply_text(f"\u2705 Сохранено: {value}")
+
+        await show_ai_menu(
+            update.effective_chat, self.db, user_id,
+            self.llm.api_url, self.llm.model,
+        )
 
     async def _send_action_keyboard(self, update: Update, context):
         user_id = update.effective_user.id
@@ -1509,6 +1939,15 @@ class MediaBot:
 
         if data.startswith(self.CB_BYPASS):
             await handle_bypass_callback(update, context, self)
+            return
+        if data == self.CB_AI_MENU:
+            await show_ai_menu(
+                query.message, self.db, user_id,
+                self.llm.api_url, self.llm.model,
+            )
+            return
+        if data.startswith(self.CB_AI):
+            await self._handle_ai_callback(update, context, data[len(self.CB_AI):])
             return
         if data == self.CB_DL_MENU:
             await self._show_download_menu(update, context)
@@ -1798,7 +2237,10 @@ class MediaBot:
                     query.message,
                     f"\U0001F916 Применяю шаблон «{template['name']}»…",
                 )
-                result = await self.llm.complete(template["prompt"], session["text"])
+                result = await self.llm.complete(
+                    template["prompt"], session["text"],
+                    chain=self._llm_chain(update.effective_user.id),
+                )
                 failed = result.startswith(LLM_ERROR_PREFIX)
                 session["last_template_id"] = template_id
                 if not failed:
@@ -1879,21 +2321,22 @@ class MediaBot:
             await self._send_long(message, result)
         # .md файлом.
         if out_fmt in (self.OUT_MD, self.OUT_BOTH):
-            title = session.get("title") or "результат"
             md = self._build_markdown(result, template_name, session)
-            base = re.sub(r"[^\w\s.-]", "", title).strip()[:50] or "result"
-            base = base.replace(" ", "_")
-            tmp_path = os.path.join(tempfile.gettempdir(), f"{base}_{template_name[:20]}.md")
-            tmp_path = re.sub(r"[^\w./-]", "_", tmp_path)
+            filename = self._md_filename(template_name, session)
+            tmp_path = os.path.join(tempfile.gettempdir(), filename)
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 fh.write(md)
             try:
+                title = (session.get("title") or "").strip()
+                caption = f"\U0001F4C4 {template_name}"
+                if title:
+                    caption += f"\n\U0001F3AC {title[:120]}"
                 with open(tmp_path, "rb") as fh:
                     await context.bot.send_document(
                         chat_id=update.effective_chat.id,
                         document=fh,
-                        filename=os.path.basename(tmp_path),
-                        caption=f"\U0001F4C4 {template_name} · Markdown",
+                        filename=filename,
+                        caption=caption,
                     )
             finally:
                 try:
@@ -1902,20 +2345,80 @@ class MediaBot:
                     pass
 
     @staticmethod
-    def _build_markdown(result, template_name, session) -> str:
-        """Собирает аккуратный .md: заголовок, источник, метаданные, результат."""
+    def _slugify(text: str, limit: int = 60) -> str:
+        """Безопасное имя файла из названия: сохраняем кириллицу и пробелы."""
+        text = (text or "").strip()
+        # Удаляем только то, что реально запрещено в именах файлов.
+        text = re.sub(r'[\\/:*?"<>|\n\r\t]', " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" .")
+        if len(text) > limit:
+            text = text[:limit].rstrip()
+        return text
+
+    def _md_filename(self, template_name: str, session) -> str:
+        """Имя .md: «Название видео — Краткое саммари — 2026-08-21.md»."""
         from datetime import datetime
-        title = session.get("title") or "Без названия"
+        title = self._slugify(session.get("title") or "")
+        if not title:
+            fallback = {
+                "youtube": "Видео YouTube",
+                "voice": "Голосовое сообщение",
+                "audio": "Аудиозапись",
+                "video": "Видеофайл",
+                "file": "Медиафайл",
+            }
+            title = fallback.get(session.get("source") or "", "Транскрипт")
+            if session.get("video_id"):
+                title += f" {session['video_id']}"
+        # Из названия шаблона убираем эмодзи-префикс, оставляя слова.
+        tmpl = self._slugify(re.sub(r"^\W+", "", template_name or ""), 40) or "Обработка"
+        date = datetime.now().strftime("%Y-%m-%d")
+        return f"{title} — {tmpl} — {date}.md"
+
+    @staticmethod
+    def _build_markdown(result, template_name, session) -> str:
+        """Готовая заметка для Obsidian: YAML-frontmatter + заголовок + текст."""
+        from datetime import datetime
+        title = (session.get("title") or "").strip()
         source = session.get("source") or ""
         video_id = session.get("video_id")
-        lines = [f"# {title}", ""]
-        meta = [f"- **Обработка:** {template_name}"]
-        meta.append(f"- **Источник:** {source}")
+        now = datetime.now()
+
+        if not title:
+            fallback = {
+                "youtube": "Видео YouTube",
+                "voice": "Голосовое сообщение",
+                "audio": "Аудиозапись",
+                "video": "Видеофайл",
+                "file": "Медиафайл",
+            }
+            title = fallback.get(source, "Транскрипт")
+
+        # YAML-frontmatter: Obsidian показывает это как свойства заметки.
+        safe_title = title.replace('"', "'")
+        fm = [
+            "---",
+            f'title: "{safe_title}"',
+            f"date: {now.strftime('%Y-%m-%d %H:%M')}",
+            f"source: {source or 'unknown'}",
+        ]
         if video_id:
-            meta.append(f"- **YouTube:** https://youtu.be/{video_id}")
-        meta.append(f"- **Дата:** {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        lines += meta + ["", "---", "", result, ""]
-        return "\n".join(lines)
+            fm.append(f"url: https://youtu.be/{video_id}")
+        fm.append(f'processing: "{template_name}"')
+        fm.append("tags: [транскрипт, yt-bot-sum]")
+        fm.append("---")
+
+        body = [
+            "",
+            f"# {title}",
+            "",
+        ]
+        if video_id:
+            body.append(f"\U0001F3AC [Смотреть на YouTube](https://youtu.be/{video_id})")
+            body.append("")
+        body.append(f"> Обработка: **{template_name}** · {now.strftime('%d.%m.%Y %H:%M')}")
+        body += ["", "---", "", result, ""]
+        return "\n".join(fm + body)
 
     async def _send_transcript_file(self, update, context):
         query = update.callback_query
@@ -1945,28 +2448,112 @@ class MediaBot:
             except OSError:
                 pass
 
+    # Иконки источников для истории.
+    SOURCE_ICONS = {
+        "youtube": "\U0001F4FA",  # 📺
+        "voice": "\U0001F3A4",    # 🎤
+        "audio": "\U0001F3B5",    # 🎵
+        "video": "\U0001F3AC",    # 🎬
+        "file": "\U0001F4C1",     # 📁
+    }
+
+    @staticmethod
+    def _pretty_size(chars: int) -> str:
+        """Человекочитаемый объём: 12 400 симв. → «12.4к»."""
+        if chars >= 1000:
+            return f"{chars / 1000:.1f}к".replace(".0к", "к")
+        return str(chars)
+
+    @staticmethod
+    def _pretty_date(raw: str) -> str:
+        """'2026-08-21 18:30' → 'сегодня 18:30' / '21.08 18:30'."""
+        from datetime import datetime, timedelta
+        raw = (raw or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                dt = datetime.strptime(raw[:19] if len(raw) >= 19 else raw, fmt)
+            except ValueError:
+                continue
+            today = datetime.now().date()
+            if dt.date() == today:
+                return f"сегодня {dt:%H:%M}"
+            if dt.date() == today - timedelta(days=1):
+                return f"вчера {dt:%H:%M}"
+            return f"{dt:%d.%m %H:%M}"
+        return raw[:16]
+
+    def _history_label(self, item: dict) -> str:
+        """Красивая подпись кнопки истории: иконка, название, объём, дата."""
+        icon = self.SOURCE_ICONS.get(item.get("source") or "", "\U0001F4C4")
+        title = (item.get("title") or "").strip()
+        if not title:
+            # Названия нет (файл без имени / видео без метаданных) —
+            # показываем осмысленный человеку заголовок вместо «youtube».
+            fallback = {
+                "youtube": "Видео YouTube",
+                "voice": "Голосовое сообщение",
+                "audio": "Аудиозапись",
+                "video": "Видеофайл",
+                "file": "Медиафайл",
+            }
+            title = fallback.get(item.get("source") or "", "Транскрипт")
+            if item.get("video_id"):
+                title += f" ({item['video_id']})"
+        # Убираем расширение у файлов — оно шумит в кнопке.
+        title = re.sub(r"\.(mp3|mp4|wav|m4a|ogg|webm|mkv|mov|aac)$", "", title, flags=re.I)
+        if len(title) > 30:
+            title = title[:29].rstrip() + "…"
+        size = self._pretty_size(item.get("chars") or 0)
+        date = self._pretty_date(item.get("date") or "")
+        return f"{icon} {title} · {size} · {date}"
+
+    async def _backfill_titles(self, user_id: int, items: list):
+        """Дописывает пропавшие названия YouTube-видео через oEmbed.
+
+        Раньше при bot-check название не сохранялось и в истории оставался
+        безликий «youtube» — теперь оно доклеивается при первом показе списка.
+        """
+        missing = [
+            it for it in items
+            if it.get("video_id") and not (it.get("title") or "").strip()
+        ][:5]  # не больше 5 запросов за раз, чтобы меню не тормозило
+        if not missing:
+            return
+        results = await asyncio.gather(
+            *(self._fetch_title_oembed(it["video_id"]) for it in missing),
+            return_exceptions=True,
+        )
+        for item, title in zip(missing, results):
+            if isinstance(title, str) and title.strip():
+                item["title"] = title.strip()
+                self.db.update_transcript_title(item["id"], user_id, title.strip())
+
     async def _show_history(self, message, user_id: int):
         items = self.db.get_transcripts(user_id, limit=8)
         if not items:
             await message.reply_text(
-                "\U0001F559 История пуста — пришлите ссылку или аудио."
+                "\U0001F559 История пуста.\n\n"
+                "Пришлите ссылку на YouTube, голосовое или аудиофайл — "
+                "транскрипт сохранится здесь и его можно будет обработать "
+                "любым шаблоном повторно.",
+                reply_markup=self.PERSISTENT_KB,
             )
             return
-        rows = []
-        for it in items:
-            title = (it["title"] or it["source"])[:38]
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        f"🔁 #{it['id']} {title} · {it['chars']} симв.",
-                        callback_data=f"{self.CB_HIST}{it['id']}",
-                    )
-                ]
-            )
-        await message.reply_text(
-            "\U0001F559 Последние транскрипты — нажмите, чтобы обработать заново:",
-            reply_markup=InlineKeyboardMarkup(rows),
+        await self._backfill_titles(user_id, items)
+        rows = [
+            [InlineKeyboardButton(
+                self._history_label(it),
+                callback_data=f"{self.CB_HIST}{it['id']}",
+            )]
+            for it in items
+        ]
+        total = self.db.count_transcripts(user_id)
+        header = (
+            f"\U0001F559 Сохранённые транскрипты ({len(items)} из {total})\n\n"
+            "Нажмите на запись — она станет активной, и её можно обработать "
+            "любым шаблоном заново."
         )
+        await message.reply_text(header, reply_markup=InlineKeyboardMarkup(rows))
 
     async def _load_history_item(self, update, context, transcript_id: str):
         query = update.callback_query
@@ -1983,10 +2570,16 @@ class MediaBot:
             video_id=item["video_id"], title=item["title"] or "",
             transcript_id=item["id"],
         )
-        preview = item["text"][:300] + ("…" if len(item["text"]) > 300 else "")
-        await query.message.reply_text(
-            f"✅ Загружен транскрипт #{item['id']} · {len(item['text'])} симв.\n\n{preview}"
+        icon = self.SOURCE_ICONS.get(item.get("source") or "", "\U0001F4C4")
+        title = (item.get("title") or "").strip() or "без названия"
+        preview = item["text"][:400] + ("…" if len(item["text"]) > 400 else "")
+        head = (
+            f"\u2705 Загружено: {icon} {title}\n"
+            f"{len(item['text'])} символов"
         )
+        if item.get("video_id"):
+            head += f" · https://youtu.be/{item['video_id']}"
+        await query.message.reply_text(f"{head}\n\n{preview}")
         await self._send_action_keyboard(update, context)
 
     async def _show_download_menu(self, update, context):
@@ -2032,11 +2625,13 @@ class MediaBot:
 
     async def _do_download(self, update, context, data: str):
         query = update.callback_query
-        session = self.user_sessions.get(update.effective_user.id)
+        user_id = update.effective_user.id
+        session = self.user_sessions.get(user_id)
         if not session or not session.get("video_id"):
             await self._safe_edit(
                 query.message, "\u26a0\ufe0f Скачивание доступно только для YouTube-видео."
             )
+            await self._send_nav(update, context)
             return
         if data.startswith(self.CB_DL_VIDEO):
             fmt_id = data[len(self.CB_DL_VIDEO):]
@@ -2044,35 +2639,128 @@ class MediaBot:
         else:
             fmt_id = data[len(self.CB_DL_AUDIO):]
             format_spec = fmt_id
+
+        busy_error = await self._acquire_user(user_id)
+        if busy_error:
+            await query.message.reply_text(busy_error)
+            return
+
         await self._safe_edit(query.message, "\u23f3 Скачиваю файл…")
         tmp = tempfile.mkdtemp()
         try:
-            path = await self._run_sync(
-                self.yt.download, session["video_id"], format_spec, tmp,
-                timeout=YT_DOWNLOAD_TIMEOUT,
-            )
-            size = os.path.getsize(path) if os.path.exists(path) else 0
+            path, last_exc = None, None
+            # Перебираем клиенты, как при аудио-fallback: web-клиент YouTube
+            # часто требует авторизацию, а android_vr/tv отдают файл без куки.
+            attempts = [
+                ("android_vr", False), ("tv", False), ("mweb", False),
+                (None, False), (None, True),
+            ]
+            for client, use_cookies in attempts:
+                if use_cookies and not yt_transcript.get_cookies_file():
+                    continue
+                try:
+                    label = client or ("web+куки" if use_cookies else "web")
+                    await self._safe_edit(
+                        query.message, f"\u23f3 Скачиваю файл… (клиент {label})"
+                    )
+                    path = await self._run_sync(
+                        self.yt.download, session["video_id"], format_spec, tmp,
+                        client, use_cookies, timeout=YT_DOWNLOAD_TIMEOUT,
+                    )
+                    if path and os.path.exists(path):
+                        break
+                    path = None
+                except (asyncio.TimeoutError, TimeoutError) as exc:
+                    last_exc = exc
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    logger.warning(
+                        "Скачивание (client=%s, cookies=%s): %s",
+                        client, use_cookies, str(exc)[:120],
+                    )
+                    continue
+
+            if not path:
+                await self._safe_edit(
+                    query.message, self._download_error_text(last_exc)
+                )
+                await self._send_nav(update, context)
+                return
+
+            size = os.path.getsize(path)
             if size > 45 * 1024 * 1024:  # лимит отправки Telegram ~50 МБ
                 await self._safe_edit(
                     query.message,
-                    "\u26a0\ufe0f Файл больше 50 МБ — Telegram не пропустит. "
-                    "Выберите качество ниже или аудио.",
+                    f"\u26a0\ufe0f Файл {size // (1024*1024)} МБ — Telegram "
+                    "пропускает до 50 МБ. Выберите качество ниже или аудио.",
                 )
+                await self._send_nav(update, context)
                 return
             with open(path, "rb") as fh:
                 await context.bot.send_document(
-                    chat_id=update.effective_chat.id, document=fh
+                    chat_id=update.effective_chat.id,
+                    document=fh,
+                    filename=os.path.basename(path),
                 )
             await self._safe_edit(query.message, "\u2705 Файл отправлен.")
-        except asyncio.TimeoutError:
-            await self._safe_edit(
-                query.message, "\u274C Скачивание заняло слишком долго — попробуйте аудио."
-            )
+            await self._send_nav(update, context)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка в _do_download")
-            await self._safe_edit(query.message, f"\u274C Ошибка скачивания: {exc}")
+            await self._safe_edit(query.message, self._download_error_text(exc))
+            await self._send_nav(update, context)
         finally:
+            self._release_user(user_id)
             threading.Timer(5.0, _cleanup_dir, args=(tmp,)).start()
+
+    @staticmethod
+    def _download_error_text(exc) -> str:
+        """Человеческое объяснение вместо сырой ошибки yt-dlp."""
+        msg = str(exc or "").lower()
+        if any(
+            s in msg for s in
+            ("cookie", "sign in", "not a bot", "confirm you", "403", "429",
+             "too many requests", "bot")
+        ):
+            return (
+                "\u274C YouTube потребовал авторизацию для скачивания этого "
+                "файла (bot-check) — все клиенты (android_vr / tv / mweb / web) "
+                "отклонены.\n\n"
+                "\U0001F527 Что помогает:\n"
+                "• транскрипт обычно всё равно доступен — обработайте текст "
+                "шаблоном, кнопки ниже;\n"
+                "• для файлов нужны куки: задайте YT_COOKIES (содержимое "
+                "cookies.txt) или YT_PROXY в настройках сервиса;\n"
+                "• часто выручает выбор аудио вместо видео."
+            )
+        if "requested format" in msg or "format is not available" in msg:
+            return (
+                "\u274C Этот формат недоступен для скачивания. "
+                "Выберите другое качество или аудио."
+            )
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in msg:
+            return (
+                "\u274C Скачивание не уложилось в лимит времени. "
+                "Попробуйте качество ниже или аудио."
+            )
+        return f"\u274C Не удалось скачать файл: {str(exc)[:150]}"
+
+    async def _send_nav(self, update, context, note: str = ""):
+        """Навигация после ЛЮБОГО действия — меню никогда не теряется."""
+        user_id = update.effective_user.id
+        session = self.user_sessions.get(user_id) or {}
+        if not session.get("text"):
+            await update.effective_message.reply_text(
+                note or "Пришлите ссылку YouTube, голосовое или аудио.",
+                reply_markup=self.PERSISTENT_KB,
+            )
+            return
+        await update.effective_message.reply_text(
+            note or "\u2699\ufe0f Что дальше?",
+            reply_markup=self._action_keyboard(
+                user_id, bool(session.get("video_id"))
+            ),
+        )
 
     async def _send_long(self, message, text: str):
         """Отправляет длинный текст кусками по 4000 символов (plain text)."""
@@ -2130,6 +2818,7 @@ async def _post_init(app):
                 BotCommand("start", "Запуск и справка"),
                 BotCommand("templates", "Шаблоны: смотреть/менять/создавать"),
                 BotCommand("history", "Сохранённые транскрипты"),
+                BotCommand("ai", "Выбор нейросети, свои ключи, тест"),
                 BotCommand("bypass", "Методы обхода YouTube"),
                 BotCommand("add_template", "Добавить шаблон"),
                 BotCommand("del_template", "Удалить шаблон"),
@@ -2178,6 +2867,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(bot.handle_callback_query))
 
     register_bypass_command(app, bot)
+    register_ai_command(app, bot)
 
     print(f"Бот {VERSION_STRING} запущен: polling + health-check сервер.")
     app.run_polling()
