@@ -18,6 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # pull-requests: read обязателен для приватных репозиториев: действие
+      # запрашивает PR, связанные с коммитом, и без этого права GitHub
+      # отвечает 403 «Resource not accessible by integration». В публичных
+      # репозиториях запрос проходит и без него.
+      pull-requests: read
     steps:
       # Версия действия закреплена вместо @master: master может измениться
       # без предупреждения и сломать релизы во всех репозиториях сразу.
